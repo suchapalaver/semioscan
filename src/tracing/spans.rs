@@ -146,6 +146,20 @@ pub(crate) fn get_daily_window(chain: NamedChain, date: NaiveDate) -> Span {
     )
 }
 
+/// Create span for resolving an arbitrary timestamp range to a block range.
+///
+/// Parent: None (root span for this operation)
+/// Children: get_block_timestamp, find_first_block_at_or_after,
+/// find_last_block_at_or_before spans
+#[inline]
+pub(crate) fn block_range_for_timestamps(start_ts: u64, end_ts: u64) -> Span {
+    tracing::info_span!(
+        "semioscan.block_range_for_timestamps",
+        start_ts = start_ts,
+        end_ts = end_ts,
+    )
+}
+
 /// Create span for processing logs in a block range for gas calculation.
 ///
 /// Parent: calculate_gas_cost_with_adapter span

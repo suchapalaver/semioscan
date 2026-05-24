@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `BlockWindowCalculator::block_range_for_timestamps` — public API for
+  resolving an arbitrary inclusive timestamp range to the inclusive block
+  range that covers it. Same binary search as `get_daily_window`, but at
+  arbitrary granularity (useful for event-driven or bridge-reconciliation
+  windows).
+- `BlockWindowError::NonMonotonicTimestamps` — typed error returned when
+  the chain's genesis and head timestamps are out of order, surfacing
+  invalid binary-search preconditions rather than returning silently-wrong
+  block boundaries.
+
 ## [0.12.1] - 2026-05-23
 
 ### Changed
