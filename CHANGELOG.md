@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `BlockWindowCalculator::with_head_ttl(Duration)` — builder method that
+  overrides the TTL used to memoize the chain head for
+  `block_range_for_timestamps`. The default
+  (`DEFAULT_HEAD_TTL`, also newly public) is 30 seconds; pass
+  `Duration::ZERO` to disable head memoization entirely.
+- `DEFAULT_HEAD_TTL` — public `const Duration` exposing the default head
+  TTL so consumers can derive values from it (e.g.
+  `with_head_ttl(DEFAULT_HEAD_TTL * 4)`) instead of using magic literals.
+
+### Changed
+
+- `BlockWindowCalculator::block_range_for_timestamps` no longer issues a
+  redundant genesis-block header fetch, `eth_blockNumber`, and head-block
+  header fetch on every call. Genesis is now memoized for the lifetime
+  of the calculator (immutable per chain); the chain head is memoized
+  per-instance with the configurable TTL above. A long-running sweep
+  that resolves N timestamp ranges on the same chain now performs 1
+  genesis fetch and 1 head fetch per TTL window, eliminating the prior
+  2·N redundant header fetches against a rate-limited RPC.
+
 ## [0.13.0] - 2026-05-23
 
 ### Added

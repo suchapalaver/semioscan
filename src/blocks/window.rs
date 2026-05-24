@@ -55,8 +55,10 @@ use crate::types::config::BlockCount;
 ///
 /// Chosen to amortize a single reconciliation sweep (typically seconds to a
 /// few tens of seconds) without letting the cached head drift far enough to
-/// shadow a recent reorg.
-const DEFAULT_HEAD_TTL: Duration = Duration::from_secs(30);
+/// shadow a recent reorg. Exposed publicly so consumers can derive values
+/// from it (e.g. `with_head_ttl(DEFAULT_HEAD_TTL * 4)`) rather than using
+/// magic literals.
+pub const DEFAULT_HEAD_TTL: Duration = Duration::from_secs(30);
 
 /// Unix timestamp in seconds (always UTC)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -307,10 +309,16 @@ impl<P: Provider> BlockWindowCalculator<P> {
     ///   `start_ts > latest_ts` / `end_ts >= latest_ts` using the cached
     ///   head, so blocks produced during the TTL window can be silently
     ///   excluded.
+    /// - At TTL expiry, concurrent callers funnel through a single
+    ///   in-flight head fetch. This avoids a thundering-herd against the
+    ///   RPC provider, but it also means a slow provider stalls every
+    ///   concurrent `block_range_for_timestamps` caller for the duration
+    ///   of that fetch.
     /// - [`Duration::ZERO`] disables head memoization entirely. Use this in
     ///   tests against a freshly-mined chain (e.g. a brand-new Anvil) where
     ///   the head is expected to move faster than the TTL.
-    /// - The default ([`Self::with_head_ttl`] not called) is 30 seconds.
+    /// - The default ([`Self::with_head_ttl`] not called) is
+    ///   [`DEFAULT_HEAD_TTL`].
     ///
     /// # Examples
     ///
