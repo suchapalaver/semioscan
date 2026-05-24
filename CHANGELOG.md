@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-05-23
+
 ### Added
 
 - `BlockWindowCalculator::block_range_for_timestamps` — public API for
@@ -18,6 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the chain's genesis and head timestamps are out of order, surfacing
   invalid binary-search preconditions rather than returning silently-wrong
   block boundaries.
+
+### Changed
+
+- `DiskCache` file I/O (open, lock, read, write, rename) now runs on the
+  blocking thread pool via `tokio::task::spawn_blocking`, so synchronous
+  std file locks no longer stall the async runtime worker holding them.
+  `load` short-circuits before the dispatch when the cache file does not
+  yet exist.
 
 ## [0.12.1] - 2026-05-23
 
