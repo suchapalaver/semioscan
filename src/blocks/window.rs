@@ -41,12 +41,24 @@ use alloy_provider::Provider;
 use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::time::{Duration, Instant};
+use tokio::sync::{Mutex, OnceCell};
 use tracing::{debug, info};
 
 use crate::blocks::cache::{BlockWindowCache, CacheKey, DiskCache};
 use crate::errors::{BlockWindowError, RpcError};
 use crate::tracing::spans;
 use crate::types::config::BlockCount;
+
+/// Default TTL for the memoized chain head used by
+/// [`BlockWindowCalculator::block_range_for_timestamps`].
+///
+/// Chosen to amortize a single reconciliation sweep (typically seconds to a
+/// few tens of seconds) without letting the cached head drift far enough to
+/// shadow a recent reorg. Exposed publicly so consumers can derive values
+/// from it (e.g. `with_head_ttl(DEFAULT_HEAD_TTL * 4)`) rather than using
+/// magic literals.
+pub const DEFAULT_HEAD_TTL: Duration = Duration::from_secs(30);
 
 /// Unix timestamp in seconds (always UTC)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -160,6 +172,87 @@ impl DailyBlockWindow {
 pub struct BlockWindowCalculator<P> {
     provider: P,
     cache: Box<dyn BlockWindowCache>,
+    bounds_memo: ChainBoundsMemo,
+}
+
+/// Memoized chain bounds shared across calls to
+/// [`BlockWindowCalculator::block_range_for_timestamps`].
+///
+/// `block_range_for_timestamps` probes the genesis block and the chain head
+/// on every invocation to short-circuit out-of-range windows and to detect
+/// non-monotonic chains. Those two values are effectively constant within a
+/// single reconciliation sweep (genesis is immutable; head moves much slower
+/// than the binary-search resolution requires). Caching them on the
+/// calculator instance eliminates `2·N` redundant header fetches for `N`
+/// timestamp lookups on the same chain.
+///
+/// Independent of the [`BlockWindowCache`] choice — that cache is keyed by
+/// `(NamedChain, NaiveDate)` and only services `get_daily_window`.
+struct ChainBoundsMemo {
+    /// Genesis timestamp. Immutable per chain — fetched once and reused for
+    /// the lifetime of the calculator.
+    genesis: OnceCell<UnixTimestamp>,
+    /// Most recently observed chain head: `(fetched_at, latest_block, latest_ts)`.
+    /// Refetched when [`Self::head_ttl`] has elapsed.
+    head: Mutex<Option<HeadEntry>>,
+    head_ttl: Duration,
+}
+
+#[derive(Clone, Copy)]
+struct HeadEntry {
+    fetched_at: Instant,
+    latest_block: BlockNumber,
+    latest_ts: UnixTimestamp,
+}
+
+impl ChainBoundsMemo {
+    fn new(head_ttl: Duration) -> Self {
+        Self {
+            genesis: OnceCell::new(),
+            head: Mutex::new(None),
+            head_ttl,
+        }
+    }
+
+    /// Returns the genesis timestamp, fetching it on first call only.
+    async fn get_or_fetch_genesis<F, Fut>(
+        &self,
+        fetch: F,
+    ) -> Result<UnixTimestamp, BlockWindowError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<UnixTimestamp, BlockWindowError>>,
+    {
+        self.genesis.get_or_try_init(fetch).await.copied()
+    }
+
+    /// Returns the chain head, refetching only when the TTL has elapsed.
+    ///
+    /// The lock is held across the fetch so concurrent callers funnel a
+    /// single in-flight RPC into one shared result, avoiding thundering
+    /// herds at TTL expiry.
+    async fn get_or_fetch_head<F, Fut>(
+        &self,
+        fetch: F,
+    ) -> Result<(BlockNumber, UnixTimestamp), BlockWindowError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<(BlockNumber, UnixTimestamp), BlockWindowError>>,
+    {
+        let mut guard = self.head.lock().await;
+        if let Some(entry) = guard.as_ref() {
+            if entry.fetched_at.elapsed() < self.head_ttl {
+                return Ok((entry.latest_block, entry.latest_ts));
+            }
+        }
+        let (latest_block, latest_ts) = fetch().await?;
+        *guard = Some(HeadEntry {
+            fetched_at: Instant::now(),
+            latest_block,
+            latest_ts,
+        });
+        Ok((latest_block, latest_ts))
+    }
 }
 
 impl<P: Provider> BlockWindowCalculator<P> {
@@ -192,7 +285,58 @@ impl<P: Provider> BlockWindowCalculator<P> {
     /// let calculator = BlockWindowCalculator::new(provider, Box::new(NoOpCache));
     /// ```
     pub fn new(provider: P, cache: Box<dyn BlockWindowCache>) -> Self {
-        Self { provider, cache }
+        Self {
+            provider,
+            cache,
+            bounds_memo: ChainBoundsMemo::new(DEFAULT_HEAD_TTL),
+        }
+    }
+
+    /// Overrides the TTL used to memoize the chain head for
+    /// [`Self::block_range_for_timestamps`].
+    ///
+    /// The genesis timestamp is immutable per chain and is always memoized
+    /// for the lifetime of the calculator regardless of this setting. Only
+    /// the chain head — the `(latest_block, latest_ts)` pair — respects this
+    /// TTL. Updating the TTL preserves any already-memoized genesis and any
+    /// still-valid cached head; the change takes effect on the next call.
+    ///
+    /// # Trade-offs
+    ///
+    /// - Shorter TTLs trade RPC traffic for fresher results. A stale head
+    ///   affects every call whose window touches the chain tip — not just
+    ///   reorg recovery: tip-adjacent ranges short-circuit through
+    ///   `start_ts > latest_ts` / `end_ts >= latest_ts` using the cached
+    ///   head, so blocks produced during the TTL window can be silently
+    ///   excluded.
+    /// - At TTL expiry, concurrent callers funnel through a single
+    ///   in-flight head fetch. This avoids a thundering-herd against the
+    ///   RPC provider, but it also means a slow provider stalls every
+    ///   concurrent `block_range_for_timestamps` caller for the duration
+    ///   of that fetch.
+    /// - [`Duration::ZERO`] disables head memoization entirely. Use this in
+    ///   tests against a freshly-mined chain (e.g. a brand-new Anvil) where
+    ///   the head is expected to move faster than the TTL.
+    /// - The default ([`Self::with_head_ttl`] not called) is
+    ///   [`DEFAULT_HEAD_TTL`].
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// use semioscan::BlockWindowCalculator;
+    /// use std::time::Duration;
+    ///
+    /// // Aggressive amortization for a long-running batch sweep.
+    /// let calculator = BlockWindowCalculator::with_memory_cache(provider)
+    ///     .with_head_ttl(Duration::from_secs(120));
+    ///
+    /// // Disable head memoization (each call refetches the chain tip).
+    /// let calculator = BlockWindowCalculator::without_cache(provider)
+    ///     .with_head_ttl(Duration::ZERO);
+    /// ```
+    pub fn with_head_ttl(mut self, ttl: Duration) -> Self {
+        self.bounds_memo.head_ttl = ttl;
+        self
     }
 
     /// Creates a calculator with a disk cache at the specified path
@@ -348,6 +492,21 @@ impl<P: Provider> BlockWindowCalculator<P> {
     /// configurable time windows (for example, bridge reconciliation where
     /// the search window is `[event_ts - padding, event_ts + lookahead]`).
     ///
+    /// # Caching
+    ///
+    /// This method does not consult the [`BlockWindowCache`] supplied to the
+    /// constructor — that cache is keyed by `(NamedChain, NaiveDate)` and
+    /// only services [`Self::get_daily_window`].
+    ///
+    /// Instead, the genesis timestamp and the chain head
+    /// (`(latest_block, latest_ts)`) are memoized per calculator instance.
+    /// Genesis is fetched once and reused forever (it is immutable per
+    /// chain); the head is refetched after a TTL elapses (default 30
+    /// seconds, configurable via [`Self::with_head_ttl`]). For
+    /// long-running consumers that resolve many timestamp ranges per
+    /// sweep, this eliminates the `2·N` redundant header fetches the
+    /// naive implementation would issue.
+    ///
     /// # Edge cases
     ///
     /// - `start_ts` at or before the genesis block's timestamp → `start_block = 0`.
@@ -393,11 +552,27 @@ impl<P: Provider> BlockWindowCalculator<P> {
             return Err(BlockWindowError::invalid_timestamp_range(start_ts, end_ts));
         }
 
-        let latest_block = self
-            .provider
-            .get_block_number()
-            .await
-            .map_err(RpcError::get_block_number_failed)?;
+        let genesis_ts = self
+            .bounds_memo
+            .get_or_fetch_genesis(|| self.get_block_timestamp(0))
+            .await?;
+
+        let (latest_block, latest_ts) = self
+            .bounds_memo
+            .get_or_fetch_head(|| async {
+                let latest_block = self
+                    .provider
+                    .get_block_number()
+                    .await
+                    .map_err(RpcError::get_block_number_failed)?;
+                let latest_ts = if latest_block == 0 {
+                    genesis_ts
+                } else {
+                    self.get_block_timestamp(latest_block).await?
+                };
+                Ok((latest_block, latest_ts))
+            })
+            .await?;
 
         info!(
             start_ts = %start_ts,
@@ -406,11 +581,15 @@ impl<P: Provider> BlockWindowCalculator<P> {
             "Resolving timestamp range to block range"
         );
 
-        let (start_block, end_block) =
-            compute_block_range_with(start_ts, end_ts, latest_block, |n| {
-                self.get_block_timestamp(n)
-            })
-            .await?;
+        let (start_block, end_block) = compute_block_range_given_bounds(
+            start_ts,
+            end_ts,
+            latest_block,
+            genesis_ts,
+            latest_ts,
+            |n| self.get_block_timestamp(n),
+        )
+        .await?;
 
         info!(
             start_ts = %start_ts,
@@ -626,22 +805,25 @@ where
     Ok(result)
 }
 
-/// Resolves a timestamp range to a block range using a caller-supplied
-/// timestamp fetcher. Pure algorithmic core of
-/// [`BlockWindowCalculator::block_range_for_timestamps`].
+/// Resolves a timestamp range to a block range using caller-supplied chain
+/// bounds and a caller-supplied per-block timestamp fetcher. Pure algorithmic
+/// core of [`BlockWindowCalculator::block_range_for_timestamps`].
 ///
-/// The function probes the chain head and the genesis block to:
-/// - short-circuit ranges that fall entirely outside chain history without
+/// `genesis_ts` and `latest_ts` are supplied by the caller (memoized by
+/// [`ChainBoundsMemo`] in the production path) so that the function:
+/// - short-circuits ranges that fall entirely outside chain history without
 ///   running the full binary search
-/// - flag obviously non-monotonic chains (genesis timestamp newer than head)
+/// - flags obviously non-monotonic chains (genesis timestamp newer than head)
 ///   as [`BlockWindowError::NonMonotonicTimestamps`] before the binary search
 ///   can return a silently-wrong boundary
 ///
 /// The full binary search only runs for ranges that overlap chain history.
-async fn compute_block_range_with<F, Fut>(
+async fn compute_block_range_given_bounds<F, Fut>(
     start_ts: UnixTimestamp,
     end_ts: UnixTimestamp,
     latest_block: BlockNumber,
+    genesis_ts: UnixTimestamp,
+    latest_ts: UnixTimestamp,
     mut fetch_ts: F,
 ) -> Result<(BlockNumber, BlockNumber), BlockWindowError>
 where
@@ -652,13 +834,6 @@ where
         start_ts <= end_ts,
         "caller must validate start_ts <= end_ts"
     );
-
-    let genesis_ts = fetch_ts(0).await?;
-    let latest_ts = if latest_block == 0 {
-        genesis_ts
-    } else {
-        fetch_ts(latest_block).await?
-    };
 
     if latest_block > 0 && genesis_ts > latest_ts {
         return Err(BlockWindowError::non_monotonic_timestamps(
@@ -874,6 +1049,39 @@ mod tests {
             let ts = timestamps[n as usize];
             Box::pin(async move { Ok(UnixTimestamp(ts)) })
         }
+    }
+
+    /// Test wrapper that probes block 0 and `latest_block` of an in-memory
+    /// fixture and forwards to [`compute_block_range_given_bounds`].
+    ///
+    /// Mirrors what [`BlockWindowCalculator::block_range_for_timestamps`]
+    /// does at runtime via [`ChainBoundsMemo`], without requiring tests to
+    /// hand-thread genesis/head timestamps into every call site.
+    async fn compute_block_range_with<F, Fut>(
+        start_ts: UnixTimestamp,
+        end_ts: UnixTimestamp,
+        latest_block: BlockNumber,
+        mut fetch_ts: F,
+    ) -> Result<(BlockNumber, BlockNumber), BlockWindowError>
+    where
+        F: FnMut(BlockNumber) -> Fut,
+        Fut: std::future::Future<Output = Result<UnixTimestamp, BlockWindowError>>,
+    {
+        let genesis_ts = fetch_ts(0).await?;
+        let latest_ts = if latest_block == 0 {
+            genesis_ts
+        } else {
+            fetch_ts(latest_block).await?
+        };
+        compute_block_range_given_bounds(
+            start_ts,
+            end_ts,
+            latest_block,
+            genesis_ts,
+            latest_ts,
+            fetch_ts,
+        )
+        .await
     }
 
     #[tokio::test]
@@ -1149,5 +1357,157 @@ mod tests {
             .unwrap();
         // No block satisfies, default to 0.
         assert_eq!(result, 0);
+    }
+
+    mod bounds_memo {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        #[tokio::test]
+        async fn genesis_fetched_only_once() {
+            let memo = ChainBoundsMemo::new(Duration::from_secs(60));
+            let counter = Arc::new(AtomicUsize::new(0));
+
+            let c1 = counter.clone();
+            let v1 = memo
+                .get_or_fetch_genesis(|| async move {
+                    c1.fetch_add(1, Ordering::SeqCst);
+                    Ok(UnixTimestamp(1000))
+                })
+                .await
+                .unwrap();
+
+            let c2 = counter.clone();
+            let v2 = memo
+                .get_or_fetch_genesis(|| async move {
+                    c2.fetch_add(1, Ordering::SeqCst);
+                    Ok(UnixTimestamp(9999))
+                })
+                .await
+                .unwrap();
+
+            assert_eq!(v1, UnixTimestamp(1000));
+            assert_eq!(v2, UnixTimestamp(1000));
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                1,
+                "second call must reuse the memoized genesis"
+            );
+        }
+
+        #[tokio::test]
+        async fn genesis_fetch_error_is_not_memoized() {
+            let memo = ChainBoundsMemo::new(Duration::from_secs(60));
+            let counter = Arc::new(AtomicUsize::new(0));
+
+            let c1 = counter.clone();
+            let err = memo
+                .get_or_fetch_genesis(|| async move {
+                    c1.fetch_add(1, Ordering::SeqCst);
+                    Err(BlockWindowError::invalid_timestamp_range(
+                        UnixTimestamp(2),
+                        UnixTimestamp(1),
+                    ))
+                })
+                .await;
+            assert!(err.is_err());
+
+            // The second attempt should retry, not return the cached error.
+            let c2 = counter.clone();
+            let v = memo
+                .get_or_fetch_genesis(|| async move {
+                    c2.fetch_add(1, Ordering::SeqCst);
+                    Ok(UnixTimestamp(1000))
+                })
+                .await
+                .unwrap();
+            assert_eq!(v, UnixTimestamp(1000));
+            assert_eq!(counter.load(Ordering::SeqCst), 2);
+        }
+
+        #[tokio::test]
+        async fn head_reused_within_ttl() {
+            let memo = ChainBoundsMemo::new(Duration::from_secs(60));
+            let counter = Arc::new(AtomicUsize::new(0));
+
+            let c1 = counter.clone();
+            let (b1, t1) = memo
+                .get_or_fetch_head(|| async move {
+                    c1.fetch_add(1, Ordering::SeqCst);
+                    Ok((100, UnixTimestamp(5000)))
+                })
+                .await
+                .unwrap();
+
+            let c2 = counter.clone();
+            let (b2, t2) = memo
+                .get_or_fetch_head(|| async move {
+                    c2.fetch_add(1, Ordering::SeqCst);
+                    Ok((200, UnixTimestamp(9999)))
+                })
+                .await
+                .unwrap();
+
+            assert_eq!((b1, t1), (100, UnixTimestamp(5000)));
+            assert_eq!((b2, t2), (100, UnixTimestamp(5000)));
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                1,
+                "second call within TTL must reuse the memoized head"
+            );
+        }
+
+        #[tokio::test]
+        async fn with_head_ttl_preserves_memo() {
+            let mut calc = BlockWindowCalculator::without_cache(dummy_provider());
+
+            // Seed the genesis OnceCell by hand (calling into the calculator
+            // would require a live provider).
+            calc.bounds_memo
+                .genesis
+                .set(UnixTimestamp(1234))
+                .expect("genesis OnceCell starts empty");
+
+            calc = calc.with_head_ttl(Duration::from_secs(120));
+
+            assert_eq!(
+                calc.bounds_memo.genesis.get().copied(),
+                Some(UnixTimestamp(1234)),
+                "with_head_ttl must preserve the memoized genesis"
+            );
+            assert_eq!(calc.bounds_memo.head_ttl, Duration::from_secs(120));
+        }
+
+        #[tokio::test]
+        async fn head_refetched_when_ttl_zero() {
+            let memo = ChainBoundsMemo::new(Duration::ZERO);
+            let counter = Arc::new(AtomicUsize::new(0));
+
+            let c1 = counter.clone();
+            let _ = memo
+                .get_or_fetch_head(|| async move {
+                    c1.fetch_add(1, Ordering::SeqCst);
+                    Ok((100, UnixTimestamp(5000)))
+                })
+                .await
+                .unwrap();
+
+            let c2 = counter.clone();
+            let (b, t) = memo
+                .get_or_fetch_head(|| async move {
+                    c2.fetch_add(1, Ordering::SeqCst);
+                    Ok((200, UnixTimestamp(6000)))
+                })
+                .await
+                .unwrap();
+
+            assert_eq!((b, t), (200, UnixTimestamp(6000)));
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                2,
+                "TTL=ZERO must skip memoization"
+            );
+        }
     }
 }

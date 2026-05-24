@@ -73,7 +73,7 @@ pub use price::{
 // === Block Windows (from blocks/) ===
 pub use blocks::{
     BlockWindowCache, BlockWindowCalculator, CacheKey, CacheStats, DailyBlockWindow, DiskCache,
-    MemoryCache, NoOpCache, UnixTimestamp,
+    MemoryCache, NoOpCache, UnixTimestamp, DEFAULT_HEAD_TTL,
 };
 
 // === Cache Types (from blocks/cache/types, re-exported via types/cache) ===
