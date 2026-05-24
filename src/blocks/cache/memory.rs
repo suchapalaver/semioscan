@@ -250,6 +250,11 @@ impl BlockWindowCache for MemoryCache {
         state.stats.clone()
     }
 
+    async fn record_skip_insert(&self) {
+        let mut state = self.state.lock().await;
+        state.stats.skip_inserts += 1;
+    }
+
     fn name(&self) -> &'static str {
         "MemoryCache"
     }

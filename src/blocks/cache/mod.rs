@@ -83,18 +83,44 @@ pub struct CacheStats {
     pub evictions: u64,
     /// Number of entries expired due to TTL
     pub expirations: u64,
+    /// Number of times an insert was deliberately skipped after a miss.
+    ///
+    /// Currently produced by [`BlockWindowCalculator::get_daily_window`]
+    /// when the requested window touches or extends past the memoized
+    /// chain tip: the lookup still misses (incrementing `misses`), but the
+    /// computed window is intentionally not persisted because future
+    /// blocks may shift the day's range and the `(chain, date)` cache key
+    /// cannot disambiguate which head was current. Surfacing the count
+    /// lets operators distinguish "expected tip skip" from "broken insert"
+    /// (cache disk full, JSON write error) without staring at debug logs,
+    /// and excludes the deliberate skips from [`Self::hit_rate`].
+    ///
+    /// [`BlockWindowCalculator::get_daily_window`]:
+    ///     crate::blocks::window::BlockWindowCalculator::get_daily_window
+    #[serde(default)]
+    pub skip_inserts: u64,
     /// Current number of entries in the cache
     pub entries: usize,
 }
 
 impl CacheStats {
-    /// Calculates the cache hit rate as a percentage (0.0 to 100.0)
+    /// Calculates the cache hit rate as a percentage (0.0 to 100.0).
+    ///
+    /// Deliberate skip-insert misses (see [`Self::skip_inserts`]) are
+    /// excluded from the denominator so that tip-touching workloads do not
+    /// degrade the reported rate. The formula is
+    /// `hits / (hits + misses - skip_inserts)`; saturating subtraction
+    /// keeps the denominator non-negative if a future cache backend
+    /// records skips without a matching miss.
     pub fn hit_rate(&self) -> f64 {
-        let total = self.hits + self.misses;
-        if total == 0 {
+        let denominator = self
+            .hits
+            .saturating_add(self.misses)
+            .saturating_sub(self.skip_inserts);
+        if denominator == 0 {
             0.0
         } else {
-            (self.hits as f64 / total as f64) * 100.0
+            (self.hits as f64 / denominator as f64) * 100.0
         }
     }
 }
@@ -103,9 +129,10 @@ impl fmt::Display for CacheStats {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "hits={}, misses={}, evictions={}, expirations={}, entries={}, hit_rate={:.1}%",
+            "hits={}, misses={}, skip_inserts={}, evictions={}, expirations={}, entries={}, hit_rate={:.1}%",
             self.hits,
             self.misses,
+            self.skip_inserts,
             self.evictions,
             self.expirations,
             self.entries,
@@ -160,8 +187,107 @@ pub trait BlockWindowCache: Send + Sync {
     /// Statistics include hits, misses, evictions, and current size.
     async fn stats(&self) -> CacheStats;
 
+    /// Records a deliberate decision not to insert a window after a miss.
+    ///
+    /// Currently invoked by
+    /// [`BlockWindowCalculator::get_daily_window`] when the requested
+    /// window touches or extends past the memoized chain tip — the
+    /// computed window is partial and the `(chain, date)` key cannot
+    /// disambiguate which head was current, so the insert is suppressed
+    /// even though the preceding `get` produced a miss. Implementations
+    /// increment [`CacheStats::skip_inserts`] so the count surfaces in
+    /// operator-facing metrics; backends that don't track stats (e.g.
+    /// [`NoOpCache`]) may leave this as a no-op.
+    ///
+    /// [`BlockWindowCalculator::get_daily_window`]:
+    ///     crate::blocks::window::BlockWindowCalculator::get_daily_window
+    async fn record_skip_insert(&self);
+
     /// Returns a human-readable name for this cache backend
     ///
     /// Used for logging and debugging.
     fn name(&self) -> &'static str;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hit_rate_excludes_skip_inserts_from_denominator() {
+        // Workload: 99 historical hits + 30 tip-touching misses, each of
+        // which also incremented skip_inserts. Without the fix, the
+        // reported rate is 99/129 ≈ 76.7%, suggesting cache trouble.
+        // With the skip_inserts adjustment, the deliberate skips are
+        // excluded and the rate reflects only the lookup intent the
+        // operator can act on.
+        let stats = CacheStats {
+            hits: 99,
+            misses: 30,
+            skip_inserts: 30,
+            ..Default::default()
+        };
+        assert_eq!(stats.hit_rate(), 100.0);
+    }
+
+    #[test]
+    fn hit_rate_falls_back_to_zero_when_all_misses_are_skips() {
+        // Cold workload that only ever queries tip-touching dates:
+        // every miss is a deliberate skip, no real lookups land. Reporting
+        // the rate as 0% (rather than NaN or panicking on divide-by-zero)
+        // keeps the metric usable.
+        let stats = CacheStats {
+            hits: 0,
+            misses: 5,
+            skip_inserts: 5,
+            ..Default::default()
+        };
+        assert_eq!(stats.hit_rate(), 0.0);
+    }
+
+    #[test]
+    fn hit_rate_unchanged_when_skip_inserts_zero() {
+        // Backwards-compat: a workload that never hits the tip-skip path
+        // produces the same rate the pre-counter formula would have.
+        let stats = CacheStats {
+            hits: 3,
+            misses: 1,
+            skip_inserts: 0,
+            ..Default::default()
+        };
+        assert_eq!(stats.hit_rate(), 75.0);
+    }
+
+    #[test]
+    fn hit_rate_saturates_when_skip_inserts_exceeds_misses() {
+        // Defensive: a future backend could conceivably record a skip
+        // without a matching miss (or surface a serialized snapshot whose
+        // counters drifted). Saturating subtraction prevents the
+        // denominator from underflowing to a giant u64 and producing a
+        // nonsense near-zero rate.
+        let stats = CacheStats {
+            hits: 0,
+            misses: 1,
+            skip_inserts: 5,
+            ..Default::default()
+        };
+        assert_eq!(stats.hit_rate(), 0.0);
+    }
+
+    #[test]
+    fn display_includes_skip_inserts() {
+        let stats = CacheStats {
+            hits: 10,
+            misses: 4,
+            skip_inserts: 2,
+            evictions: 1,
+            expirations: 0,
+            entries: 7,
+        };
+        let rendered = stats.to_string();
+        assert!(
+            rendered.contains("skip_inserts=2"),
+            "Display must surface skip_inserts so operators see it in logs: {rendered}"
+        );
+    }
 }

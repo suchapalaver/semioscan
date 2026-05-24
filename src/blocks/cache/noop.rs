@@ -59,6 +59,10 @@ impl BlockWindowCache for NoOpCache {
         CacheStats::default()
     }
 
+    async fn record_skip_insert(&self) {
+        // No statistics to track — stats() always returns CacheStats::default().
+    }
+
     fn name(&self) -> &'static str {
         "NoOpCache"
     }
