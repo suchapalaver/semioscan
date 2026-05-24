@@ -266,12 +266,14 @@ impl ChainBoundsMemo {
         Ok((latest_block, latest_ts))
     }
 
-    /// Returns just the chain head's block number, refetching only when
-    /// the TTL has elapsed. Cheaper sibling of [`Self::get_or_fetch_head`]
-    /// for callers that don't need the head's timestamp.
+    /// Returns the chain head's block number along with the head's
+    /// timestamp *if a prior call has already memoized it*, refetching
+    /// only when the TTL has elapsed. Cheaper sibling of
+    /// [`Self::get_or_fetch_head`] for callers that don't need the
+    /// head's timestamp but can opportunistically use it.
     ///
     /// A cold or stale memo is populated with only the block number — the
-    /// head's timestamp is left as `None`. This avoids the
+    /// returned `Option<UnixTimestamp>` is `None`. This avoids the
     /// `eth_getBlockByNumber(head)` round-trip that
     /// [`Self::get_or_fetch_head`] performs, and therefore avoids the
     /// transient failure modes that round-trip exposes (one-block reorgs
@@ -279,12 +281,18 @@ impl ChainBoundsMemo {
     /// A subsequent [`Self::get_or_fetch_head`] call promotes the partial
     /// entry by refetching `(block, ts)` together.
     ///
+    /// When the memo holds a full `(block, ts)` entry left by a prior
+    /// [`Self::get_or_fetch_head`] call, the timestamp is surfaced here
+    /// at zero RPC cost. Callers (notably [`get_daily_window_with`]) use
+    /// it to short-circuit tip-adjacent and past-tip windows without
+    /// forcing a head-timestamp fetch on the cold-memo path.
+    ///
     /// The lock is held across the fetch for the same thundering-herd
     /// reason as [`Self::get_or_fetch_head`].
     async fn get_or_fetch_latest_block<F, Fut>(
         &self,
         fetch: F,
-    ) -> Result<BlockNumber, BlockWindowError>
+    ) -> Result<(BlockNumber, Option<UnixTimestamp>), BlockWindowError>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<BlockNumber, BlockWindowError>>,
@@ -292,7 +300,7 @@ impl ChainBoundsMemo {
         let mut guard = self.head.lock().await;
         if let Some(entry) = guard.as_ref() {
             if entry.fetched_at.elapsed() < self.head_ttl {
-                return Ok(entry.latest_block);
+                return Ok((entry.latest_block, entry.latest_ts));
             }
         }
         let latest_block = fetch().await?;
@@ -301,7 +309,7 @@ impl ChainBoundsMemo {
             latest_block,
             latest_ts: None,
         });
-        Ok(latest_block)
+        Ok((latest_block, None))
     }
 }
 
@@ -906,6 +914,31 @@ where
 /// the closure it supplies to [`ChainBoundsMemo::get_or_fetch_head`] fetches
 /// both, so the partial block number is discarded rather than upgraded in
 /// place.
+///
+/// # Tip-adjacent and past-tip dates
+///
+/// When the memo already holds a full `(block, ts)` entry — populated by a
+/// prior [`BlockWindowCalculator::block_range_for_timestamps`] call within
+/// the TTL — the head's timestamp is surfaced here at zero RPC cost and
+/// drives the same short-circuits that
+/// [`compute_block_range_given_bounds`] applies:
+///
+/// - `start_ts > latest_ts` collapses the window to `(latest, latest)`
+///   without running the binary search — the day is entirely past the
+///   chain tip.
+/// - `end_ts_exclusive.pred() >= latest_ts` indicates the day touches the
+///   chain tip. The binary search still runs, but the result is not
+///   persisted to the [`BlockWindowCache`]: more blocks may yet land in
+///   the day's range, and the cache key `(chain, date)` has no notion of
+///   which head was current when the window was computed.
+///
+/// Cold-memo daily-window calls (no prior
+/// [`BlockWindowCalculator::block_range_for_timestamps`]) retain the
+/// pre-existing behaviour: the timestamp is unknown, the short-circuits
+/// cannot fire, and the result is cached as before. The widened failure
+/// surface introduced by the shared memo — a stale `latest_ts` left by an
+/// earlier `block_range_for_timestamps` call shadowing a `get_daily_window`
+/// query for today's date — is closed.
 async fn get_daily_window_with<F, FtFut, G, GnFut>(
     bounds_memo: &ChainBoundsMemo,
     cache: &dyn BlockWindowCache,
@@ -945,7 +978,7 @@ where
     let start_ts = UnixTimestamp::from_datetime(start_dt);
     let end_ts_exclusive = UnixTimestamp::from_datetime(end_dt);
 
-    let latest_block = bounds_memo
+    let (latest_block, memoized_latest_ts) = bounds_memo
         .get_or_fetch_latest_block(fetch_latest_block_number)
         .await?;
 
@@ -958,11 +991,36 @@ where
         "Computing daily block window"
     );
 
-    let start_block = find_first_at_or_after_with(start_ts, latest_block, &mut fetch_ts).await?;
-    let end_block =
-        find_last_at_or_before_with(end_ts_exclusive.pred(), latest_block, &mut fetch_ts).await?;
+    // The day touches or sits past the chain tip when the last second of
+    // the day is at or after the memoized head's timestamp. Whichever
+    // branch we take below, we must not persist the result: a future
+    // chain advance will produce a different (correct) window for the
+    // same `(chain, date)` cache key.
+    let day_touches_tip =
+        memoized_latest_ts.is_some_and(|latest_ts| end_ts_exclusive.pred() >= latest_ts);
 
-    let window = DailyBlockWindow::new(start_block, end_block, start_ts, end_ts_exclusive)?;
+    let window = if memoized_latest_ts.is_some_and(|latest_ts| start_ts > latest_ts) {
+        // Date is entirely past the chain tip. Mirror the empty-window
+        // sentinel that `compute_block_range_given_bounds` returns for
+        // the same case rather than running a binary search whose only
+        // possible outcome is `(latest, latest)` from the find-first /
+        // find-last sentinels.
+        debug!(
+            chain = %chain,
+            date = %date,
+            start_ts = %start_ts,
+            latest_ts = ?memoized_latest_ts,
+            "Date past chain tip — returning empty window at tip without caching"
+        );
+        DailyBlockWindow::new(latest_block, latest_block, start_ts, end_ts_exclusive)?
+    } else {
+        let start_block =
+            find_first_at_or_after_with(start_ts, latest_block, &mut fetch_ts).await?;
+        let end_block =
+            find_last_at_or_before_with(end_ts_exclusive.pred(), latest_block, &mut fetch_ts)
+                .await?;
+        DailyBlockWindow::new(start_block, end_block, start_ts, end_ts_exclusive)?
+    };
 
     info!(
         chain = %chain,
@@ -971,10 +1029,17 @@ where
         end_block = window.end_block,
         block_count = window.block_count().as_u64(),
         cache = %cache.name(),
+        cached = !day_touches_tip,
         "Computed daily block window"
     );
 
-    if let Err(e) = cache.insert(key, window.clone()).await {
+    if day_touches_tip {
+        debug!(
+            chain = %chain,
+            date = %date,
+            "Skipping cache insert: day touches chain tip and may yet gain or lose blocks"
+        );
+    } else if let Err(e) = cache.insert(key, window.clone()).await {
         debug!(error = %e, "Failed to cache block window (continuing anyway)");
     }
 
@@ -1602,7 +1667,7 @@ mod tests {
             let counter = Arc::new(AtomicUsize::new(0));
 
             let c1 = counter.clone();
-            let b1 = memo
+            let (b1, t1) = memo
                 .get_or_fetch_latest_block(|| async move {
                     c1.fetch_add(1, Ordering::SeqCst);
                     Ok(100)
@@ -1611,7 +1676,7 @@ mod tests {
                 .unwrap();
 
             let c2 = counter.clone();
-            let b2 = memo
+            let (b2, t2) = memo
                 .get_or_fetch_latest_block(|| async move {
                     c2.fetch_add(1, Ordering::SeqCst);
                     Ok(200)
@@ -1621,6 +1686,14 @@ mod tests {
 
             assert_eq!(b1, 100);
             assert_eq!(b2, 100);
+            assert_eq!(
+                t1, None,
+                "partial entry from get_or_fetch_latest_block leaves latest_ts unset"
+            );
+            assert_eq!(
+                t2, None,
+                "second call must reuse the partial entry, still without a timestamp"
+            );
             assert_eq!(
                 counter.load(Ordering::SeqCst),
                 1,
@@ -1646,7 +1719,7 @@ mod tests {
             .unwrap();
 
             let bc = block_counter.clone();
-            let b = memo
+            let (b, t) = memo
                 .get_or_fetch_latest_block(|| async move {
                     bc.fetch_add(1, Ordering::SeqCst);
                     Ok(999)
@@ -1655,6 +1728,11 @@ mod tests {
                 .unwrap();
 
             assert_eq!(b, 100);
+            assert_eq!(
+                t,
+                Some(UnixTimestamp(5000)),
+                "full entry must surface its memoized timestamp at zero RPC cost"
+            );
             assert_eq!(head_counter.load(Ordering::SeqCst), 1);
             assert_eq!(
                 block_counter.load(Ordering::SeqCst),
@@ -2146,6 +2224,185 @@ mod tests {
                 head_counter.load(Ordering::SeqCst),
                 1,
                 "eth_blockNumber must fire exactly once on cold memo"
+            );
+        }
+
+        /// Fetcher that panics if invoked — used to prove the past-tip
+        /// short-circuit fires without touching the binary search. Mirrors
+        /// the pattern in
+        /// `daily_window_uses_memoized_latest_block_in_binary_search`,
+        /// which stubs the head fetcher the same way.
+        fn fetch_ts_unreachable() -> impl FnMut(BlockNumber) -> BoxedTsFut {
+            |n: BlockNumber| {
+                Box::pin(async move {
+                    panic!(
+                        "binary search must not run when the date is past the memoized \
+                         chain tip — fetch_ts({n}) should never be called"
+                    )
+                })
+            }
+        }
+
+        #[tokio::test]
+        async fn daily_window_past_tip_skips_binary_search_and_does_not_cache() {
+            // Failure scenario from the issue: a prior `block_range_for_timestamps`
+            // call has populated the memo with a full `(latest_block, latest_ts)`
+            // entry. A subsequent `get_daily_window` call asks for a date whose
+            // `start_ts` is strictly past the memoized `latest_ts`. The pre-fix
+            // behaviour ran the binary search anyway, got `(latest, latest)` from
+            // both find-first / find-last sentinels, accepted it as a valid
+            // window, and persisted it to the cache — poisoning future
+            // `(chain, date)` lookups with a window that was never correct.
+            //
+            // The fix consults the memoized `latest_ts` and:
+            //   1. Returns the `(latest, latest)` empty-window sentinel without
+            //      probing any block (the binary search would be wasted work —
+            //      every possible probe answers "before target_ts").
+            //   2. Skips the cache insert entirely so the bad window cannot
+            //      shadow a correct one once the head advances and `latest_ts`
+            //      catches up.
+            //
+            // 2026-01-01 UTC: start_ts=1767225600. Memoized latest_ts=1_000_000_000
+            // (well before the date), latest_block=100.
+            let bounds_memo = ChainBoundsMemo::new(DEFAULT_HEAD_TTL);
+            *bounds_memo.head.lock().await = Some(HeadEntry {
+                fetched_at: Instant::now(),
+                latest_block: 100,
+                latest_ts: Some(UnixTimestamp(1_000_000_000)),
+            });
+
+            let cache = crate::blocks::cache::MemoryCache::new();
+            let head_counter = Arc::new(AtomicUsize::new(0));
+            let date = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+
+            let window = get_daily_window_with(
+                &bounds_memo,
+                &cache,
+                NamedChain::Arbitrum,
+                date,
+                fetch_ts_unreachable(),
+                counting_fetch_head(100, head_counter.clone()),
+            )
+            .await
+            .expect("past-tip window must return the empty sentinel, not error");
+
+            assert_eq!(
+                (window.start_block, window.end_block),
+                (100, 100),
+                "past-tip window collapses to (latest, latest) — same sentinel \
+                 compute_block_range_given_bounds returns for the matching case"
+            );
+            assert_eq!(
+                head_counter.load(Ordering::SeqCst),
+                0,
+                "memoized head must short-circuit the eth_blockNumber fetch too"
+            );
+            assert_eq!(
+                cache.stats().await.entries,
+                0,
+                "past-tip window must not be cached — the (chain, date) key has \
+                 no notion of which head was current and would shadow the correct \
+                 window once the chain catches up"
+            );
+        }
+
+        #[tokio::test]
+        async fn daily_window_touching_tip_runs_search_but_does_not_cache() {
+            // Tip-adjacent case: the day contains the chain head but extends
+            // past it. The binary search still runs (the day's start_block is
+            // an honest interior probe), but the result is not persisted —
+            // more blocks may land in the day's `end_ts_exclusive` range, and
+            // the cache key cannot disambiguate "computed at head=4" from
+            // "computed at head=N>4".
+            //
+            // Five-block monotonic chain. The day 2025-01-01 UTC spans
+            // 1_735_689_600..1_735_776_000. Block 1 starts the day at
+            // ts=1_735_689_700; block 4 (memoized head) has ts=1_735_750_000,
+            // which is inside the day. So `start_ts <= latest_ts <
+            // end_ts_exclusive.pred()` — day touches tip.
+            let timestamps = vec![
+                1_735_689_500, // block 0 — before the day
+                1_735_689_700, // block 1 — first block on the day
+                1_735_720_000, // block 2 — mid-day
+                1_735_745_000, // block 3 — mid-day
+                1_735_750_000, // block 4 — head, still inside the day
+            ];
+            let bounds_memo = ChainBoundsMemo::new(DEFAULT_HEAD_TTL);
+            *bounds_memo.head.lock().await = Some(HeadEntry {
+                fetched_at: Instant::now(),
+                latest_block: 4,
+                latest_ts: Some(UnixTimestamp(1_735_750_000)),
+            });
+
+            let cache = crate::blocks::cache::MemoryCache::new();
+            let log = Arc::new(StdMutex::new(Vec::<BlockNumber>::new()));
+            let head_counter = Arc::new(AtomicUsize::new(0));
+            let date = NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
+
+            let window = get_daily_window_with(
+                &bounds_memo,
+                &cache,
+                NamedChain::Arbitrum,
+                date,
+                counting_fetch_ts(timestamps, log.clone()),
+                counting_fetch_head(4, head_counter.clone()),
+            )
+            .await
+            .unwrap();
+
+            // The day's end is past the head, so `end_block` clamps to `latest`.
+            assert_eq!((window.start_block, window.end_block), (1, 4));
+            assert!(
+                !log.lock().unwrap().is_empty(),
+                "binary search must still probe blocks when the day starts \
+                 inside chain history"
+            );
+            assert_eq!(
+                cache.stats().await.entries,
+                0,
+                "tip-adjacent window must not be cached — more blocks may land \
+                 in the day's range and the cached entry would go stale silently"
+            );
+        }
+
+        #[tokio::test]
+        async fn daily_window_cold_memo_still_caches_historical_date() {
+            // Cold memo, fully historical date. The fix must not regress this
+            // path — without a memoized `latest_ts`, the short-circuits cannot
+            // fire and the cache insert must proceed as before. (If a future
+            // fix wants to gate caching on a sentinel check too, it should
+            // come from a separate decision; this test pins down today's
+            // behaviour.)
+            let timestamps = vec![
+                1_735_689_500,
+                1_735_689_700,
+                1_735_745_000,
+                1_735_775_000,
+                1_735_776_100,
+            ];
+            let bounds_memo = ChainBoundsMemo::new(DEFAULT_HEAD_TTL);
+            let cache = crate::blocks::cache::MemoryCache::new();
+            let date = NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
+
+            let log = Arc::new(StdMutex::new(Vec::<BlockNumber>::new()));
+            let head_counter = Arc::new(AtomicUsize::new(0));
+
+            let window = get_daily_window_with(
+                &bounds_memo,
+                &cache,
+                NamedChain::Arbitrum,
+                date,
+                counting_fetch_ts(timestamps, log.clone()),
+                counting_fetch_head(4, head_counter.clone()),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!((window.start_block, window.end_block), (1, 3));
+            assert_eq!(
+                cache.stats().await.entries,
+                1,
+                "cold-memo historical date must still populate the cache"
             );
         }
     }
