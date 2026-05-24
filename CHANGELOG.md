@@ -28,6 +28,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that resolves N timestamp ranges on the same chain now performs 1
   genesis fetch and 1 head fetch per TTL window, eliminating the prior
   2·N redundant header fetches against a rate-limited RPC.
+- `BlockWindowCalculator::get_daily_window` now routes its chain-head
+  lookup through the same `ChainBoundsMemo` as
+  `block_range_for_timestamps`, so the head TTL configured via
+  `with_head_ttl` amortizes across both methods. A long-cold-cache
+  backfill issues a single `eth_blockNumber` per TTL window instead of
+  one per uncached day, and mixed workloads that interleave the two
+  methods share a single head fetch. Each cold memo population now
+  also fetches the head block's timestamp (one extra
+  `eth_getBlockByNumber` per TTL window) to keep the memo shape uniform
+  across both methods.
 
 ## [0.13.0] - 2026-05-23
 
