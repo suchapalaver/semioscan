@@ -1689,5 +1689,43 @@ mod tests {
             );
             assert_eq!(head_counter.load(Ordering::SeqCst), 1);
         }
+
+        #[tokio::test]
+        async fn interior_window_threads_memoized_latest_ts_through_binary_search() {
+            // Window strictly inside chain history: both bounds drive the
+            // binary search, so the returned `(start, end)` depends on
+            // `latest_ts` being honestly threaded from the memo into
+            // `compute_block_range_given_bounds`. A regression that swaps
+            // `genesis_ts` and `latest_ts` at the call site, or zeroes
+            // out `latest_block` after the head closure runs, changes
+            // the answer (the `end_ts >= latest_ts` short-circuit fires
+            // under the wrong `latest_ts`, clamping `end_block` to
+            // `latest` instead of the correct interior block).
+            //
+            // The earlier tests prove the memo is consulted; this one
+            // proves the memoized values are actually fed to the binary
+            // search.
+            let timestamps = vec![1000, 1100, 1200, 1300, 1400];
+            let latest: BlockNumber = 4;
+            let bounds_memo = ChainBoundsMemo::new(DEFAULT_HEAD_TTL);
+
+            let log = Arc::new(StdMutex::new(Vec::<BlockNumber>::new()));
+            let head_counter = Arc::new(AtomicUsize::new(0));
+
+            let (s, e) = block_range_for_timestamps_with(
+                &bounds_memo,
+                UnixTimestamp(1150),
+                UnixTimestamp(1250),
+                counting_fetch_ts(timestamps, log.clone()),
+                counting_fetch_head(latest, head_counter.clone()),
+            )
+            .await
+            .unwrap();
+
+            // First block with ts >= 1150 is block 2 (ts=1200).
+            // Last block with ts <= 1250 is also block 2 (ts=1200).
+            assert_eq!((s, e), (2, 2));
+            assert_eq!(head_counter.load(Ordering::SeqCst), 1);
+        }
     }
 }
