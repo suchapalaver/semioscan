@@ -356,6 +356,10 @@ impl<P: Provider> BlockWindowCalculator<P> {
     ///   blocks equal `latest`, signalling an empty window past chain tip.
     /// - `end_ts` strictly less than the genesis block's timestamp → both
     ///   blocks equal `0`, signalling an empty window before chain history.
+    /// - The window falls strictly between two consecutive blocks (no block
+    ///   has a timestamp in `[start_ts, end_ts]`) → `start_block > end_block`,
+    ///   i.e. the returned tuple is inverted. Callers iterating over the
+    ///   block range should check for this to detect an empty window.
     ///
     /// # Errors
     ///
@@ -992,6 +996,31 @@ mod tests {
         // First block with ts >= 1250 is block 3 (ts=1300).
         assert_eq!(start, 3);
         assert_eq!(end, latest_block);
+    }
+
+    #[tokio::test]
+    async fn block_range_between_consecutive_blocks_returns_inverted() {
+        // The timestamp range [1150, 1180] falls strictly between block 1
+        // (ts=1100) and block 2 (ts=1200) — no block has a timestamp in the
+        // window, and the documented behaviour is that the returned tuple is
+        // inverted so callers can detect emptiness.
+        let timestamps = vec![1000, 1100, 1200, 1300, 1400];
+        let latest_block: BlockNumber = 4;
+
+        let (start, end) = compute_block_range_with(
+            UnixTimestamp(1150),
+            UnixTimestamp(1180),
+            latest_block,
+            fetcher_from(timestamps),
+        )
+        .await
+        .unwrap();
+
+        // First block with ts >= 1150 is block 2 (ts=1200).
+        // Last  block with ts <= 1180 is block 1 (ts=1100).
+        assert_eq!(start, 2);
+        assert_eq!(end, 1);
+        assert!(start > end, "empty window should yield inverted range");
     }
 
     #[tokio::test]
