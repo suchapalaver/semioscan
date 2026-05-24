@@ -195,8 +195,12 @@ struct ChainBoundsMemo {
     /// Genesis timestamp. Immutable per chain — fetched once and reused for
     /// the lifetime of the calculator.
     genesis: OnceCell<UnixTimestamp>,
-    /// Most recently observed chain head: `(fetched_at, latest_block, latest_ts)`.
-    /// Refetched when [`Self::head_ttl`] has elapsed.
+    /// Most recently observed chain head. `latest_ts` is `None` when the
+    /// entry was populated by [`Self::get_or_fetch_latest_block`], which
+    /// only fetches the block number; [`Self::get_or_fetch_head`] promotes
+    /// such a partial entry by refetching the full `(block, ts)` pair when
+    /// it needs the timestamp. Refetched in full when [`Self::head_ttl`]
+    /// has elapsed.
     head: Mutex<Option<HeadEntry>>,
     head_ttl: Duration,
 }
@@ -205,7 +209,7 @@ struct ChainBoundsMemo {
 struct HeadEntry {
     fetched_at: Instant,
     latest_block: BlockNumber,
-    latest_ts: UnixTimestamp,
+    latest_ts: Option<UnixTimestamp>,
 }
 
 impl ChainBoundsMemo {
@@ -229,7 +233,10 @@ impl ChainBoundsMemo {
         self.genesis.get_or_try_init(fetch).await.copied()
     }
 
-    /// Returns the chain head, refetching only when the TTL has elapsed.
+    /// Returns the chain head's `(block, timestamp)` pair, refetching only
+    /// when the TTL has elapsed or when the cached entry is partial (a
+    /// block number without a timestamp, populated by a prior
+    /// [`Self::get_or_fetch_latest_block`] call).
     ///
     /// The lock is held across the fetch so concurrent callers funnel a
     /// single in-flight RPC into one shared result, avoiding thundering
@@ -245,16 +252,56 @@ impl ChainBoundsMemo {
         let mut guard = self.head.lock().await;
         if let Some(entry) = guard.as_ref() {
             if entry.fetched_at.elapsed() < self.head_ttl {
-                return Ok((entry.latest_block, entry.latest_ts));
+                if let Some(latest_ts) = entry.latest_ts {
+                    return Ok((entry.latest_block, latest_ts));
+                }
             }
         }
         let (latest_block, latest_ts) = fetch().await?;
         *guard = Some(HeadEntry {
             fetched_at: Instant::now(),
             latest_block,
-            latest_ts,
+            latest_ts: Some(latest_ts),
         });
         Ok((latest_block, latest_ts))
+    }
+
+    /// Returns just the chain head's block number, refetching only when
+    /// the TTL has elapsed. Cheaper sibling of [`Self::get_or_fetch_head`]
+    /// for callers that don't need the head's timestamp.
+    ///
+    /// A cold or stale memo is populated with only the block number — the
+    /// head's timestamp is left as `None`. This avoids the
+    /// `eth_getBlockByNumber(head)` round-trip that
+    /// [`Self::get_or_fetch_head`] performs, and therefore avoids the
+    /// transient failure modes that round-trip exposes (one-block reorgs
+    /// orphaning the just-reported head, free-tier provider cache lag).
+    /// A subsequent [`Self::get_or_fetch_head`] call promotes the partial
+    /// entry by refetching `(block, ts)` together.
+    ///
+    /// The lock is held across the fetch for the same thundering-herd
+    /// reason as [`Self::get_or_fetch_head`].
+    async fn get_or_fetch_latest_block<F, Fut>(
+        &self,
+        fetch: F,
+    ) -> Result<BlockNumber, BlockWindowError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<BlockNumber, BlockWindowError>>,
+    {
+        let mut guard = self.head.lock().await;
+        if let Some(entry) = guard.as_ref() {
+            if entry.fetched_at.elapsed() < self.head_ttl {
+                return Ok(entry.latest_block);
+            }
+        }
+        let latest_block = fetch().await?;
+        *guard = Some(HeadEntry {
+            fetched_at: Instant::now(),
+            latest_block,
+            latest_ts: None,
+        });
+        Ok(latest_block)
     }
 }
 
@@ -552,13 +599,16 @@ impl<P: Provider> BlockWindowCalculator<P> {
     ///
     /// The `(chain, date)` result is stored in the [`BlockWindowCache`] supplied
     /// to the constructor (disk / memory / no-op). Independently, the chain
-    /// head used to bound the binary search is memoized per calculator
-    /// instance via [`ChainBoundsMemo`], with the TTL configurable through
-    /// [`Self::with_head_ttl`] (default [`DEFAULT_HEAD_TTL`]). That memo is
-    /// shared with [`Self::block_range_for_timestamps`], so a head fetched by
-    /// either method amortizes the next call to the other within the TTL —
-    /// long-cold-cache backfills issue a single `eth_blockNumber` instead of
-    /// one per uncached day.
+    /// head's block number used to bound the binary search is memoized per
+    /// calculator instance via [`ChainBoundsMemo`], with the TTL configurable
+    /// through [`Self::with_head_ttl`] (default [`DEFAULT_HEAD_TTL`]). That
+    /// memo is shared with [`Self::block_range_for_timestamps`], so the head
+    /// fetched by either method amortizes subsequent
+    /// [`Self::get_daily_window`] calls within the TTL — long-cold-cache
+    /// backfills issue a single `eth_blockNumber` instead of one per uncached
+    /// day. The reuse from `get_daily_window` to
+    /// `block_range_for_timestamps` is partial: the latter additionally
+    /// needs the head's timestamp, which `get_daily_window` does not fetch.
     ///
     /// # Arguments
     /// * `chain` - The named chain for which to calculate the block window
@@ -838,13 +888,20 @@ where
 /// [`ChainBoundsMemo`], binary search, and cache insertion — can be exercised
 /// in tests without a live RPC.
 ///
-/// The chain head is routed through [`ChainBoundsMemo::get_or_fetch_head`] so
-/// the same head is reused by subsequent
-/// [`BlockWindowCalculator::block_range_for_timestamps`] and
-/// [`BlockWindowCalculator::get_daily_window`] calls within the TTL. The
-/// closure fetches the head's timestamp alongside the block number — wasted
-/// work for callers that only need the number, but it keeps the memo shape
-/// uniform across both methods.
+/// The chain head's block number is routed through
+/// [`ChainBoundsMemo::get_or_fetch_latest_block`] — the thinner sibling of
+/// [`ChainBoundsMemo::get_or_fetch_head`] that fetches only the block
+/// number. The binary search needs the block number to bound its probes but
+/// never the head's timestamp, so the daily-window path doesn't pay the
+/// `eth_getBlockByNumber(head)` round-trip nor inherit its transient
+/// failure modes (one-block tip reorgs, free-tier provider cache lag).
+///
+/// Storage is shared with [`ChainBoundsMemo::get_or_fetch_head`]: a head
+/// populated here is reused by subsequent
+/// [`BlockWindowCalculator::get_daily_window`] calls within the TTL, and
+/// reused as far as the block number goes by
+/// [`BlockWindowCalculator::block_range_for_timestamps`] — that method then
+/// refetches the timestamp it needs.
 async fn get_daily_window_with<F, FtFut, G, GnFut>(
     bounds_memo: &ChainBoundsMemo,
     cache: &dyn BlockWindowCache,
@@ -884,12 +941,8 @@ where
     let start_ts = UnixTimestamp::from_datetime(start_dt);
     let end_ts_exclusive = UnixTimestamp::from_datetime(end_dt);
 
-    let (latest_block, _latest_ts) = bounds_memo
-        .get_or_fetch_head(|| async {
-            let latest_block = fetch_latest_block_number().await?;
-            let latest_ts = fetch_ts(latest_block).await?;
-            Ok((latest_block, latest_ts))
-        })
+    let latest_block = bounds_memo
+        .get_or_fetch_latest_block(fetch_latest_block_number)
         .await?;
 
     info!(
@@ -1537,6 +1590,115 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn latest_block_reused_within_ttl() {
+            // Sibling of `head_reused_within_ttl` for the thinner
+            // block-number-only path. Two calls within the TTL must
+            // collapse onto a single `eth_blockNumber` fetch.
+            let memo = ChainBoundsMemo::new(Duration::from_secs(60));
+            let counter = Arc::new(AtomicUsize::new(0));
+
+            let c1 = counter.clone();
+            let b1 = memo
+                .get_or_fetch_latest_block(|| async move {
+                    c1.fetch_add(1, Ordering::SeqCst);
+                    Ok(100)
+                })
+                .await
+                .unwrap();
+
+            let c2 = counter.clone();
+            let b2 = memo
+                .get_or_fetch_latest_block(|| async move {
+                    c2.fetch_add(1, Ordering::SeqCst);
+                    Ok(200)
+                })
+                .await
+                .unwrap();
+
+            assert_eq!(b1, 100);
+            assert_eq!(b2, 100);
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                1,
+                "second call within TTL must reuse the memoized block number"
+            );
+        }
+
+        #[tokio::test]
+        async fn get_or_fetch_latest_block_reuses_full_entry() {
+            // Cross-method reuse in the direction `get_or_fetch_head →
+            // get_or_fetch_latest_block`: a full entry already has the
+            // block number we need, so the second call must not fetch.
+            let memo = ChainBoundsMemo::new(Duration::from_secs(60));
+            let head_counter = Arc::new(AtomicUsize::new(0));
+            let block_counter = Arc::new(AtomicUsize::new(0));
+
+            let hc = head_counter.clone();
+            memo.get_or_fetch_head(|| async move {
+                hc.fetch_add(1, Ordering::SeqCst);
+                Ok((100, UnixTimestamp(5000)))
+            })
+            .await
+            .unwrap();
+
+            let bc = block_counter.clone();
+            let b = memo
+                .get_or_fetch_latest_block(|| async move {
+                    bc.fetch_add(1, Ordering::SeqCst);
+                    Ok(999)
+                })
+                .await
+                .unwrap();
+
+            assert_eq!(b, 100);
+            assert_eq!(head_counter.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                block_counter.load(Ordering::SeqCst),
+                0,
+                "block-only fetcher must not fire when a full entry is fresh"
+            );
+        }
+
+        #[tokio::test]
+        async fn get_or_fetch_head_upgrades_partial_entry() {
+            // Cross-method reuse in the direction `get_or_fetch_latest_block
+            // → get_or_fetch_head`: a partial entry lacks the timestamp,
+            // so `get_or_fetch_head` must fall through and refetch the
+            // `(block, ts)` pair. The block from the partial entry is
+            // discarded — head may have moved between the two calls, and
+            // the simplest correct behaviour is to refetch both rather
+            // than reuse a stale block number.
+            let memo = ChainBoundsMemo::new(Duration::from_secs(60));
+            let block_counter = Arc::new(AtomicUsize::new(0));
+            let head_counter = Arc::new(AtomicUsize::new(0));
+
+            let bc = block_counter.clone();
+            memo.get_or_fetch_latest_block(|| async move {
+                bc.fetch_add(1, Ordering::SeqCst);
+                Ok(100)
+            })
+            .await
+            .unwrap();
+
+            let hc = head_counter.clone();
+            let (b, t) = memo
+                .get_or_fetch_head(|| async move {
+                    hc.fetch_add(1, Ordering::SeqCst);
+                    Ok((101, UnixTimestamp(6000)))
+                })
+                .await
+                .unwrap();
+
+            assert_eq!((b, t), (101, UnixTimestamp(6000)));
+            assert_eq!(block_counter.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                head_counter.load(Ordering::SeqCst),
+                1,
+                "full-head fetcher must fire to upgrade a partial entry"
+            );
+        }
+
+        #[tokio::test]
         async fn head_refetched_when_ttl_zero() {
             let memo = ChainBoundsMemo::new(Duration::ZERO);
             let counter = Arc::new(AtomicUsize::new(0));
@@ -1842,7 +2004,7 @@ mod tests {
             *bounds_memo.head.lock().await = Some(HeadEntry {
                 fetched_at: Instant::now(),
                 latest_block: 4,
-                latest_ts: UnixTimestamp(1_735_776_100),
+                latest_ts: Some(UnixTimestamp(1_735_776_100)),
             });
 
             let log = Arc::new(StdMutex::new(Vec::<BlockNumber>::new()));
@@ -1905,6 +2067,82 @@ mod tests {
             // Last block with ts <= 1250 is also block 2 (ts=1200).
             assert_eq!((s, e), (2, 2));
             assert_eq!(head_counter.load(Ordering::SeqCst), 1);
+        }
+
+        /// Returns `timestamps[block]` for every block except `failing_block`,
+        /// for which it returns [`RpcError::BlockNotFound`] — simulating a
+        /// transient tip error (one-block reorg, free-tier provider cache
+        /// lag) that orphans the just-reported head between
+        /// `eth_blockNumber` and `eth_getBlockByNumber`.
+        fn fetch_ts_failing_at(
+            timestamps: Vec<i64>,
+            failing_block: BlockNumber,
+        ) -> impl FnMut(BlockNumber) -> BoxedTsFut {
+            move |n: BlockNumber| {
+                if n == failing_block {
+                    return Box::pin(async move {
+                        Err(BlockWindowError::from(RpcError::BlockNotFound {
+                            block_number: n,
+                        }))
+                    });
+                }
+                let ts = timestamps[n as usize];
+                Box::pin(async move { Ok(UnixTimestamp(ts)) })
+            }
+        }
+
+        #[tokio::test]
+        async fn daily_window_survives_transient_head_ts_failure() {
+            // Cold memo, historical date well inside chain history. The
+            // chain has just experienced a one-block reorg, so
+            // `eth_getBlockByNumber(head)` returns BlockNotFound. The
+            // binary search only needs to probe blocks 0–3 for this
+            // interior date, so the head's timestamp is operationally
+            // irrelevant — the call should succeed.
+            //
+            // Pre-fix, `get_daily_window_with` routes through
+            // `get_or_fetch_head`, whose closure fetches the head's
+            // timestamp eagerly; this test exposes the regression by
+            // failing on `fetch_ts(4)`. Post-fix, daily-window routes
+            // through `get_or_fetch_latest_block` and never fetches the
+            // head's timestamp on the cold-memo path.
+            //
+            // 2025-01-15 UTC: start_ts=1736899200, end_ts_exclusive=1736985600.
+            let timestamps = vec![
+                1_736_899_100, // block 0 — just before the day (genesis)
+                1_736_899_300, // block 1 — first block on the day (start_block)
+                1_736_950_000, // block 2 — mid-day (end_block)
+                1_736_990_000, // block 3 — after the day
+                1_736_995_000, // block 4 — head, after the day
+            ];
+            let latest: BlockNumber = 4;
+            let bounds_memo = ChainBoundsMemo::new(DEFAULT_HEAD_TTL);
+            let cache = NoOpCache;
+            let date = NaiveDate::from_ymd_opt(2025, 1, 15).unwrap();
+
+            let head_counter = Arc::new(AtomicUsize::new(0));
+
+            let window = get_daily_window_with(
+                &bounds_memo,
+                &cache,
+                NamedChain::Arbitrum,
+                date,
+                fetch_ts_failing_at(timestamps, latest),
+                counting_fetch_head(latest, head_counter.clone()),
+            )
+            .await
+            .expect(
+                "historical-date daily-window must succeed even when \
+                 fetch_ts(head) errors — the binary search never needs \
+                 the head's timestamp for an interior date",
+            );
+
+            assert_eq!((window.start_block, window.end_block), (1, 2));
+            assert_eq!(
+                head_counter.load(Ordering::SeqCst),
+                1,
+                "eth_blockNumber must fire exactly once on cold memo"
+            );
         }
     }
 }
