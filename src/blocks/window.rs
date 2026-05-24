@@ -50,8 +50,9 @@ use crate::errors::{BlockWindowError, RpcError};
 use crate::tracing::spans;
 use crate::types::config::BlockCount;
 
-/// Default TTL for the memoized chain head used by
-/// [`BlockWindowCalculator::block_range_for_timestamps`].
+/// Default TTL for the memoized chain head shared by
+/// [`BlockWindowCalculator::block_range_for_timestamps`] and
+/// [`BlockWindowCalculator::get_daily_window`].
 ///
 /// Chosen to amortize a single reconciliation sweep (typically seconds to a
 /// few tens of seconds) without letting the cached head drift far enough to
@@ -176,15 +177,17 @@ pub struct BlockWindowCalculator<P> {
 }
 
 /// Memoized chain bounds shared across calls to
-/// [`BlockWindowCalculator::block_range_for_timestamps`].
+/// [`BlockWindowCalculator::block_range_for_timestamps`] and
+/// [`BlockWindowCalculator::get_daily_window`].
 ///
 /// `block_range_for_timestamps` probes the genesis block and the chain head
 /// on every invocation to short-circuit out-of-range windows and to detect
-/// non-monotonic chains. Those two values are effectively constant within a
+/// non-monotonic chains; `get_daily_window` needs the same chain head to
+/// bound its binary search. Those values are effectively constant within a
 /// single reconciliation sweep (genesis is immutable; head moves much slower
 /// than the binary-search resolution requires). Caching them on the
-/// calculator instance eliminates `2·N` redundant header fetches for `N`
-/// timestamp lookups on the same chain.
+/// calculator instance eliminates redundant header fetches both within each
+/// method and across mixed workloads that interleave the two.
 ///
 /// Independent of the [`BlockWindowCache`] choice — that cache is keyed by
 /// `(NamedChain, NaiveDate)` and only services `get_daily_window`.
@@ -292,14 +295,17 @@ impl<P: Provider> BlockWindowCalculator<P> {
         }
     }
 
-    /// Overrides the TTL used to memoize the chain head for
-    /// [`Self::block_range_for_timestamps`].
+    /// Overrides the TTL used to memoize the chain head for both
+    /// [`Self::block_range_for_timestamps`] and [`Self::get_daily_window`].
     ///
     /// The genesis timestamp is immutable per chain and is always memoized
     /// for the lifetime of the calculator regardless of this setting. Only
     /// the chain head — the `(latest_block, latest_ts)` pair — respects this
     /// TTL. Updating the TTL preserves any already-memoized genesis and any
     /// still-valid cached head; the change takes effect on the next call.
+    ///
+    /// Both methods share the same memo, so a head fetched by either
+    /// amortizes across subsequent calls to the other within the TTL.
     ///
     /// # Trade-offs
     ///
@@ -312,8 +318,7 @@ impl<P: Provider> BlockWindowCalculator<P> {
     /// - At TTL expiry, concurrent callers funnel through a single
     ///   in-flight head fetch. This avoids a thundering-herd against the
     ///   RPC provider, but it also means a slow provider stalls every
-    ///   concurrent `block_range_for_timestamps` caller for the duration
-    ///   of that fetch.
+    ///   concurrent caller for the duration of that fetch.
     /// - [`Duration::ZERO`] disables head memoization entirely. Use this in
     ///   tests against a freshly-mined chain (e.g. a brand-new Anvil) where
     ///   the head is expected to move faster than the TTL.
@@ -451,34 +456,6 @@ impl<P: Provider> BlockWindowCalculator<P> {
         Ok(UnixTimestamp::from_u64(block.header.timestamp))
     }
 
-    /// Binary search to find the first block at or after the target timestamp.
-    ///
-    /// Thin instrumentation wrapper over [`find_first_at_or_after_with`].
-    async fn find_first_block_at_or_after(
-        &self,
-        target_ts: UnixTimestamp,
-        latest_block: BlockNumber,
-    ) -> Result<BlockNumber, BlockWindowError> {
-        let span = spans::find_first_block_at_or_after(target_ts.as_u64(), latest_block);
-        let _guard = span.enter();
-
-        find_first_at_or_after_with(target_ts, latest_block, |n| self.get_block_timestamp(n)).await
-    }
-
-    /// Binary search to find the last block at or before the target timestamp.
-    ///
-    /// Thin instrumentation wrapper over [`find_last_at_or_before_with`].
-    async fn find_last_block_at_or_before(
-        &self,
-        target_ts: UnixTimestamp,
-        latest_block: BlockNumber,
-    ) -> Result<BlockNumber, BlockWindowError> {
-        let span = spans::find_last_block_at_or_before(target_ts.as_u64(), latest_block);
-        let _guard = span.enter();
-
-        find_last_at_or_before_with(target_ts, latest_block, |n| self.get_block_timestamp(n)).await
-    }
-
     /// Resolves an inclusive timestamp range to the inclusive block range that
     /// covers it.
     ///
@@ -571,6 +548,18 @@ impl<P: Provider> BlockWindowCalculator<P> {
     /// 2. If not found, performs binary searches to find the block range
     /// 3. Saves the result to the cache for future use
     ///
+    /// # Caching
+    ///
+    /// The `(chain, date)` result is stored in the [`BlockWindowCache`] supplied
+    /// to the constructor (disk / memory / no-op). Independently, the chain
+    /// head used to bound the binary search is memoized per calculator
+    /// instance via [`ChainBoundsMemo`], with the TTL configurable through
+    /// [`Self::with_head_ttl`] (default [`DEFAULT_HEAD_TTL`]). That memo is
+    /// shared with [`Self::block_range_for_timestamps`], so a head fetched by
+    /// either method amortizes the next call to the other within the TTL —
+    /// long-cold-cache backfills issue a single `eth_blockNumber` instead of
+    /// one per uncached day.
+    ///
     /// # Arguments
     /// * `chain` - The named chain for which to calculate the block window
     /// * `date` - The UTC date for which to calculate the block window
@@ -600,76 +589,21 @@ impl<P: Provider> BlockWindowCalculator<P> {
         let span = spans::get_daily_window(chain, date);
         let _guard = span.enter();
 
-        let key = CacheKey::new(chain, date);
-
-        // Check cache first
-        if let Some(window) = self.cache.get(&key).await {
-            info!(
-                chain = %chain,
-                date = %date,
-                cache = %self.cache.name(),
-                cached = true,
-                "Retrieved daily block window from cache"
-            );
-            return Ok(window);
-        }
-
-        // Calculate UTC day boundaries
-        let start_dt = Utc
-            .with_ymd_and_hms(date.year(), date.month(), date.day(), 0, 0, 0)
-            .single()
-            .ok_or_else(|| BlockWindowError::invalid_date_conversion(date))?;
-
-        let end_dt = start_dt
-            .checked_add_signed(chrono::TimeDelta::days(1))
-            .ok_or_else(|| BlockWindowError::date_arithmetic_overflow(date))?;
-
-        let start_ts = UnixTimestamp::from_datetime(start_dt);
-        let end_ts_exclusive = UnixTimestamp::from_datetime(end_dt);
-
-        // Get latest block number
-        let latest_block = self
-            .provider
-            .get_block_number()
-            .await
-            .map_err(RpcError::get_block_number_failed)?;
-
-        info!(
-            chain = %chain,
-            date = %date,
-            start_ts = %start_ts,
-            end_ts_exclusive = %end_ts_exclusive,
-            latest_block,
-            "Computing daily block window"
-        );
-
-        // Binary search for block boundaries
-        let start_block = self
-            .find_first_block_at_or_after(start_ts, latest_block)
-            .await?;
-
-        let end_block = self
-            .find_last_block_at_or_before(end_ts_exclusive.pred(), latest_block)
-            .await?;
-
-        let window = DailyBlockWindow::new(start_block, end_block, start_ts, end_ts_exclusive)?;
-
-        info!(
-            chain = %chain,
-            date = %date,
-            start_block = window.start_block,
-            end_block = window.end_block,
-            block_count = window.block_count().as_u64(),
-            cache = %self.cache.name(),
-            "Computed daily block window"
-        );
-
-        // Save to cache (ignore errors - caching is best-effort)
-        if let Err(e) = self.cache.insert(key, window.clone()).await {
-            debug!(error = %e, "Failed to cache block window (continuing anyway)");
-        }
-
-        Ok(window)
+        get_daily_window_with(
+            &self.bounds_memo,
+            self.cache.as_ref(),
+            chain,
+            date,
+            |n| self.get_block_timestamp(n),
+            || async {
+                self.provider
+                    .get_block_number()
+                    .await
+                    .map_err(RpcError::get_block_number_failed)
+                    .map_err(BlockWindowError::from)
+            },
+        )
+        .await
     }
 }
 
@@ -896,6 +830,98 @@ where
     );
 
     Ok((start_block, end_block))
+}
+
+/// Memo-aware resolution of a UTC date to its inclusive daily block window.
+/// Pulled out of [`BlockWindowCalculator::get_daily_window`] so the full path —
+/// cache lookup, date-to-timestamp conversion, head memoization via
+/// [`ChainBoundsMemo`], binary search, and cache insertion — can be exercised
+/// in tests without a live RPC.
+///
+/// The chain head is routed through [`ChainBoundsMemo::get_or_fetch_head`] so
+/// the same head is reused by subsequent
+/// [`BlockWindowCalculator::block_range_for_timestamps`] and
+/// [`BlockWindowCalculator::get_daily_window`] calls within the TTL. The
+/// closure fetches the head's timestamp alongside the block number — wasted
+/// work for callers that only need the number, but it keeps the memo shape
+/// uniform across both methods.
+async fn get_daily_window_with<F, FtFut, G, GnFut>(
+    bounds_memo: &ChainBoundsMemo,
+    cache: &dyn BlockWindowCache,
+    chain: NamedChain,
+    date: NaiveDate,
+    mut fetch_ts: F,
+    fetch_latest_block_number: G,
+) -> Result<DailyBlockWindow, BlockWindowError>
+where
+    F: FnMut(BlockNumber) -> FtFut,
+    FtFut: std::future::Future<Output = Result<UnixTimestamp, BlockWindowError>>,
+    G: FnOnce() -> GnFut,
+    GnFut: std::future::Future<Output = Result<BlockNumber, BlockWindowError>>,
+{
+    let key = CacheKey::new(chain, date);
+
+    if let Some(window) = cache.get(&key).await {
+        info!(
+            chain = %chain,
+            date = %date,
+            cache = %cache.name(),
+            cached = true,
+            "Retrieved daily block window from cache"
+        );
+        return Ok(window);
+    }
+
+    let start_dt = Utc
+        .with_ymd_and_hms(date.year(), date.month(), date.day(), 0, 0, 0)
+        .single()
+        .ok_or_else(|| BlockWindowError::invalid_date_conversion(date))?;
+
+    let end_dt = start_dt
+        .checked_add_signed(chrono::TimeDelta::days(1))
+        .ok_or_else(|| BlockWindowError::date_arithmetic_overflow(date))?;
+
+    let start_ts = UnixTimestamp::from_datetime(start_dt);
+    let end_ts_exclusive = UnixTimestamp::from_datetime(end_dt);
+
+    let (latest_block, _latest_ts) = bounds_memo
+        .get_or_fetch_head(|| async {
+            let latest_block = fetch_latest_block_number().await?;
+            let latest_ts = fetch_ts(latest_block).await?;
+            Ok((latest_block, latest_ts))
+        })
+        .await?;
+
+    info!(
+        chain = %chain,
+        date = %date,
+        start_ts = %start_ts,
+        end_ts_exclusive = %end_ts_exclusive,
+        latest_block,
+        "Computing daily block window"
+    );
+
+    let start_block = find_first_at_or_after_with(start_ts, latest_block, &mut fetch_ts).await?;
+    let end_block =
+        find_last_at_or_before_with(end_ts_exclusive.pred(), latest_block, &mut fetch_ts).await?;
+
+    let window = DailyBlockWindow::new(start_block, end_block, start_ts, end_ts_exclusive)?;
+
+    info!(
+        chain = %chain,
+        date = %date,
+        start_block = window.start_block,
+        end_block = window.end_block,
+        block_count = window.block_count().as_u64(),
+        cache = %cache.name(),
+        "Computed daily block window"
+    );
+
+    if let Err(e) = cache.insert(key, window.clone()).await {
+        debug!(error = %e, "Failed to cache block window (continuing anyway)");
+    }
+
+    Ok(window)
 }
 
 #[cfg(test)]
@@ -1551,6 +1577,7 @@ mod tests {
     /// is exercised under `cargo test`.
     mod wiring {
         use super::*;
+        use crate::blocks::cache::NoOpCache;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::{Arc, Mutex as StdMutex};
 
@@ -1688,6 +1715,158 @@ mod tests {
                 "block 0 must be fetched exactly once for a single-block chain (calls: {calls:?})"
             );
             assert_eq!(head_counter.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn daily_window_head_memoized_across_two_calls_within_ttl() {
+            // Two consecutive cache misses on the same calculator should
+            // issue exactly one `eth_blockNumber`. The chain head fetched
+            // for the first call must be reused by the second within the
+            // TTL — this is the per-instance amortization that the issue
+            // (closes #6) calls out as missing on the daily-window path.
+            let timestamps = vec![
+                1_735_689_500, // block 0 — before 2025-01-01 UTC
+                1_735_689_700, // block 1 — first block on 2025-01-01 UTC
+                1_735_745_000, // block 2 — mid-day
+                1_735_775_000, // block 3 — last block on 2025-01-01 UTC
+                1_735_776_100, // block 4 — after the day (head)
+            ];
+            let latest: BlockNumber = 4;
+            let bounds_memo = ChainBoundsMemo::new(DEFAULT_HEAD_TTL);
+            let cache = NoOpCache;
+            let date = NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
+
+            let log = Arc::new(StdMutex::new(Vec::<BlockNumber>::new()));
+            let head_counter = Arc::new(AtomicUsize::new(0));
+
+            let w1 = get_daily_window_with(
+                &bounds_memo,
+                &cache,
+                NamedChain::Arbitrum,
+                date,
+                counting_fetch_ts(timestamps.clone(), log.clone()),
+                counting_fetch_head(latest, head_counter.clone()),
+            )
+            .await
+            .unwrap();
+            assert_eq!((w1.start_block, w1.end_block), (1, 3));
+
+            let w2 = get_daily_window_with(
+                &bounds_memo,
+                &cache,
+                NamedChain::Arbitrum,
+                date,
+                counting_fetch_ts(timestamps, log.clone()),
+                counting_fetch_head(latest, head_counter.clone()),
+            )
+            .await
+            .unwrap();
+            assert_eq!((w2.start_block, w2.end_block), (1, 3));
+
+            assert_eq!(
+                head_counter.load(Ordering::SeqCst),
+                1,
+                "eth_blockNumber must fire exactly once across two cache misses within TTL"
+            );
+        }
+
+        #[tokio::test]
+        async fn daily_window_reuses_head_populated_by_block_range_for_timestamps() {
+            // Mixed workload: a `block_range_for_timestamps` call leaves the
+            // memo populated (genesis + head). A subsequent
+            // `get_daily_window` call within the same TTL must reuse that
+            // head instead of issuing a fresh `eth_blockNumber`. The 2·N
+            // reduction won in #4 only generalises to mixed workloads if
+            // both methods consult the same memo.
+            let timestamps = vec![
+                1_735_689_500,
+                1_735_689_700,
+                1_735_745_000,
+                1_735_775_000,
+                1_735_776_100,
+            ];
+            let latest: BlockNumber = 4;
+            let bounds_memo = ChainBoundsMemo::new(DEFAULT_HEAD_TTL);
+            let cache = NoOpCache;
+
+            let log = Arc::new(StdMutex::new(Vec::<BlockNumber>::new()));
+            let head_counter = Arc::new(AtomicUsize::new(0));
+
+            block_range_for_timestamps_with(
+                &bounds_memo,
+                UnixTimestamp(1_735_689_600),
+                UnixTimestamp(1_735_775_999),
+                counting_fetch_ts(timestamps.clone(), log.clone()),
+                counting_fetch_head(latest, head_counter.clone()),
+            )
+            .await
+            .unwrap();
+
+            let date = NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
+            let w = get_daily_window_with(
+                &bounds_memo,
+                &cache,
+                NamedChain::Arbitrum,
+                date,
+                counting_fetch_ts(timestamps, log.clone()),
+                counting_fetch_head(latest, head_counter.clone()),
+            )
+            .await
+            .unwrap();
+            assert_eq!((w.start_block, w.end_block), (1, 3));
+
+            assert_eq!(
+                head_counter.load(Ordering::SeqCst),
+                1,
+                "get_daily_window must reuse the head memoized by block_range_for_timestamps"
+            );
+        }
+
+        #[tokio::test]
+        async fn daily_window_uses_memoized_latest_block_in_binary_search() {
+            // Pre-seed the memo and stub the head fetcher with a fixture
+            // index that would panic if invoked (`latest=99` against a
+            // 5-element timestamp table). A regression that bypasses the
+            // memo — e.g. by reverting to `provider.get_block_number()`
+            // inside `get_daily_window` — would invoke the stub and
+            // either index-panic or return the wrong bound. Either
+            // failure mode surfaces here.
+            let timestamps = vec![
+                1_735_689_500,
+                1_735_689_700,
+                1_735_745_000,
+                1_735_775_000,
+                1_735_776_100,
+            ];
+            let bounds_memo = ChainBoundsMemo::new(DEFAULT_HEAD_TTL);
+            *bounds_memo.head.lock().await = Some(HeadEntry {
+                fetched_at: Instant::now(),
+                latest_block: 4,
+                latest_ts: UnixTimestamp(1_735_776_100),
+            });
+
+            let log = Arc::new(StdMutex::new(Vec::<BlockNumber>::new()));
+            let head_counter = Arc::new(AtomicUsize::new(0));
+            let cache = NoOpCache;
+            let date = NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
+
+            let w = get_daily_window_with(
+                &bounds_memo,
+                &cache,
+                NamedChain::Arbitrum,
+                date,
+                counting_fetch_ts(timestamps, log.clone()),
+                counting_fetch_head(99, head_counter.clone()),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!((w.start_block, w.end_block), (1, 3));
+            assert_eq!(
+                head_counter.load(Ordering::SeqCst),
+                0,
+                "pre-populated head must short-circuit the fetcher"
+            );
         }
 
         #[tokio::test]

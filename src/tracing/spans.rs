@@ -105,38 +105,12 @@ pub(crate) fn get_block_timestamp(block_number: BlockNumber) -> Span {
     tracing::debug_span!("semioscan.get_block_timestamp", block_number = block_number,)
 }
 
-/// Create span for finding first block at or after a target timestamp.
-///
-/// Parent: get_daily_window span
-/// Children: get_block_timestamp spans (during binary search)
-#[inline]
-pub(crate) fn find_first_block_at_or_after(target_ts: u64, latest_block: BlockNumber) -> Span {
-    tracing::debug_span!(
-        "semioscan.find_first_block_at_or_after",
-        target_ts = target_ts,
-        latest_block = latest_block,
-    )
-}
-
-/// Create span for finding last block at or before a target timestamp.
-///
-/// Parent: get_daily_window span
-/// Children: get_block_timestamp spans (during binary search)
-#[inline]
-pub(crate) fn find_last_block_at_or_before(target_ts: u64, latest_block: BlockNumber) -> Span {
-    tracing::debug_span!(
-        "semioscan.find_last_block_at_or_before",
-        target_ts = target_ts,
-        latest_block = latest_block,
-    )
-}
-
 /// Create span for calculating daily block window for a specific date.
 ///
 /// This is the main public API for block window calculations.
 ///
 /// Parent: None (root span for this operation)
-/// Children: find_first_block_at_or_after, find_last_block_at_or_before spans
+/// Children: get_block_timestamp spans (during binary search)
 #[inline]
 pub(crate) fn get_daily_window(chain: NamedChain, date: NaiveDate) -> Span {
     tracing::info_span!(
@@ -149,8 +123,7 @@ pub(crate) fn get_daily_window(chain: NamedChain, date: NaiveDate) -> Span {
 /// Create span for resolving an arbitrary timestamp range to a block range.
 ///
 /// Parent: None (root span for this operation)
-/// Children: get_block_timestamp, find_first_block_at_or_after,
-/// find_last_block_at_or_before spans
+/// Children: get_block_timestamp spans (during binary search)
 #[inline]
 pub(crate) fn block_range_for_timestamps(start_ts: u64, end_ts: u64) -> Span {
     tracing::info_span!(
