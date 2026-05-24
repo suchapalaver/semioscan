@@ -307,24 +307,9 @@ impl<P: Provider> BlockWindowCalculator<P> {
         Ok(UnixTimestamp::from_u64(block.header.timestamp))
     }
 
-    /// Binary search to find the first block at or after the target timestamp
+    /// Binary search to find the first block at or after the target timestamp.
     ///
-    /// Returns the block number of the first block with timestamp >= target_ts
-    ///
-    /// # Algorithm
-    ///
-    /// Uses binary search to efficiently locate the boundary block. The search maintains
-    /// the invariant that `result` always points to a block with timestamp >= target_ts.
-    ///
-    /// - **Search space**: [0, latest_block]
-    /// - **Invariant**: All blocks < lo have timestamp < target_ts
-    /// - **Invariant**: All blocks > hi have timestamp >= target_ts (or unknown)
-    /// - **Result**: The smallest block number with timestamp >= target_ts
-    ///
-    /// # Complexity
-    ///
-    /// - Time: O(log n) where n is the number of blocks
-    /// - RPC calls: O(log n) - one `eth_getBlockByNumber` per iteration
+    /// Thin instrumentation wrapper over [`find_first_at_or_after_with`].
     async fn find_first_block_at_or_after(
         &self,
         target_ts: UnixTimestamp,
@@ -333,53 +318,12 @@ impl<P: Provider> BlockWindowCalculator<P> {
         let span = spans::find_first_block_at_or_after(target_ts.as_u64(), latest_block);
         let _guard = span.enter();
 
-        // Initialize search space: [0, latest_block]
-        let mut lo = 0u64;
-        let mut hi = latest_block;
-        // Default to latest_block if all blocks are >= target_ts
-        let mut result = latest_block;
-
-        while lo <= hi {
-            let mid = (lo + hi) / 2;
-            let ts = self.get_block_timestamp(mid).await?;
-
-            if ts >= target_ts {
-                // Mid block is a candidate - it's at or after target
-                // Keep looking left for earlier blocks that also qualify
-                result = mid;
-                if mid == 0 {
-                    // Can't go lower than block 0
-                    break;
-                }
-                hi = mid - 1;
-            } else {
-                // Mid block is too early - search right half
-                lo = mid + 1;
-            }
-        }
-
-        debug!(target_ts = %target_ts, result, "Found first block at or after timestamp");
-        Ok(result)
+        find_first_at_or_after_with(target_ts, latest_block, |n| self.get_block_timestamp(n)).await
     }
 
-    /// Binary search to find the last block at or before the target timestamp
+    /// Binary search to find the last block at or before the target timestamp.
     ///
-    /// Returns the block number of the last block with timestamp <= target_ts
-    ///
-    /// # Algorithm
-    ///
-    /// Uses binary search to efficiently locate the boundary block. The search maintains
-    /// the invariant that `result` always points to a block with timestamp <= target_ts.
-    ///
-    /// - **Search space**: [0, latest_block]
-    /// - **Invariant**: All blocks < lo have timestamp <= target_ts (or unknown)
-    /// - **Invariant**: All blocks > hi have timestamp > target_ts
-    /// - **Result**: The largest block number with timestamp <= target_ts
-    ///
-    /// # Complexity
-    ///
-    /// - Time: O(log n) where n is the number of blocks
-    /// - RPC calls: O(log n) - one `eth_getBlockByNumber` per iteration
+    /// Thin instrumentation wrapper over [`find_last_at_or_before_with`].
     async fn find_last_block_at_or_before(
         &self,
         target_ts: UnixTimestamp,
@@ -388,33 +332,95 @@ impl<P: Provider> BlockWindowCalculator<P> {
         let span = spans::find_last_block_at_or_before(target_ts.as_u64(), latest_block);
         let _guard = span.enter();
 
-        // Initialize search space: [0, latest_block]
-        let mut lo = 0u64;
-        let mut hi = latest_block;
-        // Default to 0 if all blocks are > target_ts
-        let mut result = 0u64;
+        find_last_at_or_before_with(target_ts, latest_block, |n| self.get_block_timestamp(n)).await
+    }
 
-        while lo <= hi {
-            let mid = (lo + hi) / 2;
-            let ts = self.get_block_timestamp(mid).await?;
+    /// Resolves an inclusive timestamp range to the inclusive block range that
+    /// covers it.
+    ///
+    /// Returns `(start_block, end_block)` where:
+    /// - `start_block` is the first block with `timestamp >= start_ts`
+    /// - `end_block` is the last block with `timestamp <= end_ts`
+    ///
+    /// This is the same binary search used by [`Self::get_daily_window`], but
+    /// at arbitrary timestamp granularity rather than full UTC days. It is
+    /// intended for callers that need to resolve event-driven or
+    /// configurable time windows (for example, bridge reconciliation where
+    /// the search window is `[event_ts - padding, event_ts + lookahead]`).
+    ///
+    /// # Edge cases
+    ///
+    /// - `start_ts` at or before the genesis block's timestamp → `start_block = 0`.
+    /// - `end_ts` at or after the chain head's timestamp → `end_block = latest`.
+    /// - `start_ts` strictly greater than the chain head's timestamp → both
+    ///   blocks equal `latest`, signalling an empty window past chain tip.
+    /// - `end_ts` strictly less than the genesis block's timestamp → both
+    ///   blocks equal `0`, signalling an empty window before chain history.
+    /// - The window falls strictly between two consecutive blocks (no block
+    ///   has a timestamp in `[start_ts, end_ts]`) → `start_block > end_block`,
+    ///   i.e. the returned tuple is inverted. Callers iterating over the
+    ///   block range should check for this to detect an empty window.
+    ///
+    /// # Errors
+    ///
+    /// - [`BlockWindowError::InvalidTimestampRange`] when `start_ts > end_ts`.
+    /// - [`BlockWindowError::NonMonotonicTimestamps`] when the chain's genesis
+    ///   and head timestamps are not in increasing order. The binary search
+    ///   assumes monotonic timestamps; surfacing this as a typed error avoids
+    ///   silently returning wrong block boundaries.
+    /// - [`BlockWindowError::Rpc`] for provider failures.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// use semioscan::{BlockWindowCalculator, UnixTimestamp};
+    ///
+    /// let calculator = BlockWindowCalculator::without_cache(provider);
+    /// let start = UnixTimestamp::from_u64(1_700_000_000);
+    /// let end = UnixTimestamp::from_u64(1_700_086_400);
+    /// let (start_block, end_block) =
+    ///     calculator.block_range_for_timestamps(start, end).await?;
+    /// ```
+    pub async fn block_range_for_timestamps(
+        &self,
+        start_ts: UnixTimestamp,
+        end_ts: UnixTimestamp,
+    ) -> Result<(BlockNumber, BlockNumber), BlockWindowError> {
+        let span = spans::block_range_for_timestamps(start_ts.as_u64(), end_ts.as_u64());
+        let _guard = span.enter();
 
-            if ts <= target_ts {
-                // Mid block is a candidate - it's at or before target
-                // Keep looking right for later blocks that also qualify
-                result = mid;
-                lo = mid + 1;
-            } else {
-                // Mid block is too late - search left half
-                if mid == 0 {
-                    // Can't go lower than block 0
-                    break;
-                }
-                hi = mid - 1;
-            }
+        if start_ts > end_ts {
+            return Err(BlockWindowError::invalid_timestamp_range(start_ts, end_ts));
         }
 
-        debug!(target_ts = %target_ts, result, "Found last block at or before timestamp");
-        Ok(result)
+        let latest_block = self
+            .provider
+            .get_block_number()
+            .await
+            .map_err(RpcError::get_block_number_failed)?;
+
+        info!(
+            start_ts = %start_ts,
+            end_ts = %end_ts,
+            latest_block,
+            "Resolving timestamp range to block range"
+        );
+
+        let (start_block, end_block) =
+            compute_block_range_with(start_ts, end_ts, latest_block, |n| {
+                self.get_block_timestamp(n)
+            })
+            .await?;
+
+        info!(
+            start_ts = %start_ts,
+            end_ts = %end_ts,
+            start_block,
+            end_block,
+            "Resolved timestamp range to block range"
+        );
+
+        Ok((start_block, end_block))
     }
 
     /// Gets (or computes and caches) the daily block window for a specific chain and date
@@ -526,9 +532,188 @@ impl<P: Provider> BlockWindowCalculator<P> {
     }
 }
 
+/// Binary search for the first block with `timestamp >= target_ts`, using a
+/// caller-supplied async timestamp fetcher.
+///
+/// Decoupling the algorithm from the [`Provider`] makes the search testable
+/// against in-memory chain fixtures without standing up a real RPC endpoint.
+///
+/// # Algorithm
+///
+/// - **Search space**: `[0, latest_block]`
+/// - **Invariant**: blocks `< lo` have `timestamp < target_ts`
+/// - **Invariant**: `result` (when assigned) has `timestamp >= target_ts`
+/// - **Result**: the smallest block number with `timestamp >= target_ts`, or
+///   `latest_block` if no block satisfies the predicate
+///
+/// # Complexity
+///
+/// - Time: O(log n) where n is the number of blocks
+/// - Calls: O(log n) invocations of `fetch_ts`
+async fn find_first_at_or_after_with<F, Fut>(
+    target_ts: UnixTimestamp,
+    latest_block: BlockNumber,
+    mut fetch_ts: F,
+) -> Result<BlockNumber, BlockWindowError>
+where
+    F: FnMut(BlockNumber) -> Fut,
+    Fut: std::future::Future<Output = Result<UnixTimestamp, BlockWindowError>>,
+{
+    let mut lo = 0u64;
+    let mut hi = latest_block;
+    let mut result = latest_block;
+
+    while lo <= hi {
+        let mid = (lo + hi) / 2;
+        let ts = fetch_ts(mid).await?;
+
+        if ts >= target_ts {
+            result = mid;
+            if mid == 0 {
+                break;
+            }
+            hi = mid - 1;
+        } else {
+            lo = mid + 1;
+        }
+    }
+
+    debug!(target_ts = %target_ts, result, "Found first block at or after timestamp");
+    Ok(result)
+}
+
+/// Binary search for the last block with `timestamp <= target_ts`, using a
+/// caller-supplied async timestamp fetcher.
+///
+/// Counterpart to [`find_first_at_or_after_with`].
+///
+/// # Algorithm
+///
+/// - **Search space**: `[0, latest_block]`
+/// - **Invariant**: blocks `> hi` have `timestamp > target_ts`
+/// - **Invariant**: `result` (when assigned) has `timestamp <= target_ts`
+/// - **Result**: the largest block number with `timestamp <= target_ts`, or
+///   `0` if no block satisfies the predicate
+async fn find_last_at_or_before_with<F, Fut>(
+    target_ts: UnixTimestamp,
+    latest_block: BlockNumber,
+    mut fetch_ts: F,
+) -> Result<BlockNumber, BlockWindowError>
+where
+    F: FnMut(BlockNumber) -> Fut,
+    Fut: std::future::Future<Output = Result<UnixTimestamp, BlockWindowError>>,
+{
+    let mut lo = 0u64;
+    let mut hi = latest_block;
+    let mut result = 0u64;
+
+    while lo <= hi {
+        let mid = (lo + hi) / 2;
+        let ts = fetch_ts(mid).await?;
+
+        if ts <= target_ts {
+            result = mid;
+            lo = mid + 1;
+        } else {
+            if mid == 0 {
+                break;
+            }
+            hi = mid - 1;
+        }
+    }
+
+    debug!(target_ts = %target_ts, result, "Found last block at or before timestamp");
+    Ok(result)
+}
+
+/// Resolves a timestamp range to a block range using a caller-supplied
+/// timestamp fetcher. Pure algorithmic core of
+/// [`BlockWindowCalculator::block_range_for_timestamps`].
+///
+/// The function probes the chain head and the genesis block to:
+/// - short-circuit ranges that fall entirely outside chain history without
+///   running the full binary search
+/// - flag obviously non-monotonic chains (genesis timestamp newer than head)
+///   as [`BlockWindowError::NonMonotonicTimestamps`] before the binary search
+///   can return a silently-wrong boundary
+///
+/// The full binary search only runs for ranges that overlap chain history.
+async fn compute_block_range_with<F, Fut>(
+    start_ts: UnixTimestamp,
+    end_ts: UnixTimestamp,
+    latest_block: BlockNumber,
+    mut fetch_ts: F,
+) -> Result<(BlockNumber, BlockNumber), BlockWindowError>
+where
+    F: FnMut(BlockNumber) -> Fut,
+    Fut: std::future::Future<Output = Result<UnixTimestamp, BlockWindowError>>,
+{
+    debug_assert!(
+        start_ts <= end_ts,
+        "caller must validate start_ts <= end_ts"
+    );
+
+    let genesis_ts = fetch_ts(0).await?;
+    let latest_ts = if latest_block == 0 {
+        genesis_ts
+    } else {
+        fetch_ts(latest_block).await?
+    };
+
+    if latest_block > 0 && genesis_ts > latest_ts {
+        return Err(BlockWindowError::non_monotonic_timestamps(
+            0,
+            latest_block,
+            genesis_ts,
+            latest_ts,
+        ));
+    }
+
+    // Range entirely past chain head: empty window at chain tip.
+    if start_ts > latest_ts {
+        return Ok((latest_block, latest_block));
+    }
+    // Range entirely before genesis: empty window at chain start.
+    if end_ts < genesis_ts {
+        return Ok((0, 0));
+    }
+
+    let start_block = if start_ts <= genesis_ts {
+        0
+    } else {
+        find_first_at_or_after_with(start_ts, latest_block, &mut fetch_ts).await?
+    };
+    let end_block = if end_ts >= latest_ts {
+        latest_block
+    } else {
+        find_last_at_or_before_with(end_ts, latest_block, &mut fetch_ts).await?
+    };
+
+    Ok((start_block, end_block))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_provider::ProviderBuilder;
+
+    /// Provider for validation tests that fail before any RPC call.
+    fn dummy_provider() -> impl Provider {
+        ProviderBuilder::new().connect_http("http://localhost:1".parse().unwrap())
+    }
+
+    #[tokio::test]
+    async fn block_range_for_timestamps_rejects_inverted_range() {
+        let calculator = BlockWindowCalculator::without_cache(dummy_provider());
+        let err = calculator
+            .block_range_for_timestamps(UnixTimestamp(2000), UnixTimestamp(1000))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, BlockWindowError::InvalidTimestampRange { .. }),
+            "expected InvalidTimestampRange, got: {err:?}"
+        );
+    }
 
     #[test]
     fn test_cache_key_display() {
@@ -671,5 +856,298 @@ mod tests {
         // Should saturate rather than wrap
         let count = window.unwrap().block_count();
         assert_eq!(count.as_u64(), 101);
+    }
+
+    /// In-memory chain fixture used by `compute_block_range_with` tests.
+    ///
+    /// `timestamps[i]` is the timestamp of block `i`. Tests pick whether the
+    /// sequence is monotonic; deliberately non-monotonic fixtures exercise
+    /// the typed error path.
+    fn fetcher_from(
+        timestamps: Vec<i64>,
+    ) -> impl FnMut(
+        BlockNumber,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<UnixTimestamp, BlockWindowError>>>,
+    > {
+        move |n: BlockNumber| {
+            let ts = timestamps[n as usize];
+            Box::pin(async move { Ok(UnixTimestamp(ts)) })
+        }
+    }
+
+    #[tokio::test]
+    async fn block_range_target_inside_chain_history() {
+        // Five-block monotonic chain spanning ts=1000..=1400.
+        let timestamps = vec![1000, 1100, 1200, 1300, 1400];
+        let latest_block: BlockNumber = (timestamps.len() - 1) as BlockNumber;
+
+        let (start, end) = compute_block_range_with(
+            UnixTimestamp(1150),
+            UnixTimestamp(1350),
+            latest_block,
+            fetcher_from(timestamps),
+        )
+        .await
+        .unwrap();
+
+        // First block with ts >= 1150 is block 2 (ts=1200).
+        // Last block with ts <= 1350 is block 3 (ts=1300).
+        assert_eq!(start, 2);
+        assert_eq!(end, 3);
+    }
+
+    #[tokio::test]
+    async fn block_range_exact_boundary_match() {
+        // Edge case: the timestamp range hits block boundaries exactly.
+        let timestamps = vec![1000, 1100, 1200, 1300, 1400];
+        let latest_block: BlockNumber = 4;
+
+        let (start, end) = compute_block_range_with(
+            UnixTimestamp(1100),
+            UnixTimestamp(1300),
+            latest_block,
+            fetcher_from(timestamps),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(start, 1);
+        assert_eq!(end, 3);
+    }
+
+    #[tokio::test]
+    async fn block_range_target_before_genesis_returns_zero() {
+        // Chain starts at ts=1000; query a window that ends before genesis.
+        let timestamps = vec![1000, 1100, 1200, 1300, 1400];
+        let latest_block: BlockNumber = 4;
+
+        let (start, end) = compute_block_range_with(
+            UnixTimestamp(500),
+            UnixTimestamp(900),
+            latest_block,
+            fetcher_from(timestamps),
+        )
+        .await
+        .unwrap();
+
+        // Range entirely before chain history collapses to (0, 0).
+        assert_eq!(start, 0);
+        assert_eq!(end, 0);
+    }
+
+    #[tokio::test]
+    async fn block_range_start_before_genesis_clamps_to_zero() {
+        // Range starts before genesis but ends inside chain history:
+        // start_block should clamp to 0.
+        let timestamps = vec![1000, 1100, 1200, 1300, 1400];
+        let latest_block: BlockNumber = 4;
+
+        let (start, end) = compute_block_range_with(
+            UnixTimestamp(500),
+            UnixTimestamp(1250),
+            latest_block,
+            fetcher_from(timestamps),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(start, 0);
+        // Last block with ts <= 1250 is block 2 (ts=1200).
+        assert_eq!(end, 2);
+    }
+
+    #[tokio::test]
+    async fn block_range_target_after_latest_returns_latest() {
+        // Query a window that lies entirely after the chain head.
+        let timestamps = vec![1000, 1100, 1200, 1300, 1400];
+        let latest_block: BlockNumber = 4;
+
+        let (start, end) = compute_block_range_with(
+            UnixTimestamp(2000),
+            UnixTimestamp(3000),
+            latest_block,
+            fetcher_from(timestamps),
+        )
+        .await
+        .unwrap();
+
+        // Range entirely past chain head collapses to (latest, latest).
+        assert_eq!(start, latest_block);
+        assert_eq!(end, latest_block);
+    }
+
+    #[tokio::test]
+    async fn block_range_end_after_latest_clamps_to_latest() {
+        // Range starts inside chain history but ends past chain head:
+        // end_block should clamp to latest.
+        let timestamps = vec![1000, 1100, 1200, 1300, 1400];
+        let latest_block: BlockNumber = 4;
+
+        let (start, end) = compute_block_range_with(
+            UnixTimestamp(1250),
+            UnixTimestamp(9999),
+            latest_block,
+            fetcher_from(timestamps),
+        )
+        .await
+        .unwrap();
+
+        // First block with ts >= 1250 is block 3 (ts=1300).
+        assert_eq!(start, 3);
+        assert_eq!(end, latest_block);
+    }
+
+    #[tokio::test]
+    async fn block_range_between_consecutive_blocks_returns_inverted() {
+        // The timestamp range [1150, 1180] falls strictly between block 1
+        // (ts=1100) and block 2 (ts=1200) — no block has a timestamp in the
+        // window, and the documented behaviour is that the returned tuple is
+        // inverted so callers can detect emptiness.
+        let timestamps = vec![1000, 1100, 1200, 1300, 1400];
+        let latest_block: BlockNumber = 4;
+
+        let (start, end) = compute_block_range_with(
+            UnixTimestamp(1150),
+            UnixTimestamp(1180),
+            latest_block,
+            fetcher_from(timestamps),
+        )
+        .await
+        .unwrap();
+
+        // First block with ts >= 1150 is block 2 (ts=1200).
+        // Last  block with ts <= 1180 is block 1 (ts=1100).
+        assert_eq!(start, 2);
+        assert_eq!(end, 1);
+        assert!(start > end, "empty window should yield inverted range");
+    }
+
+    #[tokio::test]
+    async fn block_range_non_monotonic_chain_errors() {
+        // Genesis ts > head ts — flagged as non-monotonic before the binary
+        // search can return wrong boundaries.
+        let timestamps = vec![5000, 4000, 3000, 2000, 1000];
+        let latest_block: BlockNumber = 4;
+
+        let err = compute_block_range_with(
+            UnixTimestamp(2500),
+            UnixTimestamp(4500),
+            latest_block,
+            fetcher_from(timestamps),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            BlockWindowError::NonMonotonicTimestamps { .. }
+        ));
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Non-monotonic"),
+            "expected non-monotonic message, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn block_range_single_block_chain() {
+        // Edge case: chain with only the genesis block.
+        let timestamps = vec![1500];
+        let latest_block: BlockNumber = 0;
+
+        // Range that contains the single block.
+        let (start, end) = compute_block_range_with(
+            UnixTimestamp(1000),
+            UnixTimestamp(2000),
+            latest_block,
+            fetcher_from(timestamps.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!((start, end), (0, 0));
+
+        // Range entirely after the single block.
+        let (start, end) = compute_block_range_with(
+            UnixTimestamp(3000),
+            UnixTimestamp(4000),
+            latest_block,
+            fetcher_from(timestamps.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!((start, end), (0, 0));
+
+        // Range entirely before the single block.
+        let (start, end) = compute_block_range_with(
+            UnixTimestamp(500),
+            UnixTimestamp(800),
+            latest_block,
+            fetcher_from(timestamps),
+        )
+        .await
+        .unwrap();
+        assert_eq!((start, end), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn find_first_at_or_after_target_inside_history() {
+        let timestamps = vec![1000, 1100, 1200, 1300, 1400];
+        let result = find_first_at_or_after_with(UnixTimestamp(1150), 4, fetcher_from(timestamps))
+            .await
+            .unwrap();
+        // First block with ts >= 1150 is block 2 (ts=1200).
+        assert_eq!(result, 2);
+    }
+
+    #[tokio::test]
+    async fn find_first_at_or_after_returns_latest_when_target_past_head() {
+        let timestamps = vec![1000, 1100, 1200];
+        let result = find_first_at_or_after_with(UnixTimestamp(5000), 2, fetcher_from(timestamps))
+            .await
+            .unwrap();
+        // No block satisfies, default to latest.
+        assert_eq!(result, 2);
+    }
+
+    #[tokio::test]
+    async fn find_first_at_or_after_returns_zero_when_target_before_genesis() {
+        let timestamps = vec![1000, 1100, 1200];
+        let result = find_first_at_or_after_with(UnixTimestamp(500), 2, fetcher_from(timestamps))
+            .await
+            .unwrap();
+        // Block 0 satisfies (>= 500), so first qualifying block is 0.
+        assert_eq!(result, 0);
+    }
+
+    #[tokio::test]
+    async fn find_last_at_or_before_target_inside_history() {
+        let timestamps = vec![1000, 1100, 1200, 1300, 1400];
+        let result = find_last_at_or_before_with(UnixTimestamp(1250), 4, fetcher_from(timestamps))
+            .await
+            .unwrap();
+        // Last block with ts <= 1250 is block 2 (ts=1200).
+        assert_eq!(result, 2);
+    }
+
+    #[tokio::test]
+    async fn find_last_at_or_before_returns_latest_when_target_past_head() {
+        let timestamps = vec![1000, 1100, 1200];
+        let result = find_last_at_or_before_with(UnixTimestamp(5000), 2, fetcher_from(timestamps))
+            .await
+            .unwrap();
+        // All blocks satisfy <= 5000, so the latest one wins.
+        assert_eq!(result, 2);
+    }
+
+    #[tokio::test]
+    async fn find_last_at_or_before_returns_zero_when_target_before_genesis() {
+        let timestamps = vec![1000, 1100, 1200];
+        let result = find_last_at_or_before_with(UnixTimestamp(500), 2, fetcher_from(timestamps))
+            .await
+            .unwrap();
+        // No block satisfies, default to 0.
+        assert_eq!(result, 0);
     }
 }

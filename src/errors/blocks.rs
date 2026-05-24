@@ -119,6 +119,28 @@ pub enum BlockWindowError {
         source: serde_json::Error,
     },
 
+    /// Chain block timestamps are not monotonically increasing.
+    ///
+    /// The binary-search algorithms in this module assume that later blocks
+    /// have later timestamps. This error is returned when that assumption is
+    /// detected to be violated — for example, when the genesis block has a
+    /// later timestamp than the chain head. Surfacing this as a typed error
+    /// avoids returning silently-wrong block boundaries to callers.
+    #[error(
+        "Non-monotonic block timestamps detected: block {earlier_block} has \
+         timestamp {earlier_ts}, block {later_block} has timestamp {later_ts}"
+    )]
+    NonMonotonicTimestamps {
+        /// The earlier (smaller) block number in the inconsistent pair.
+        earlier_block: BlockNumber,
+        /// The later (larger) block number in the inconsistent pair.
+        later_block: BlockNumber,
+        /// Timestamp observed at `earlier_block`.
+        earlier_ts: UnixTimestamp,
+        /// Timestamp observed at `later_block` — expected to be `>= earlier_ts`.
+        later_ts: UnixTimestamp,
+    },
+
     /// RPC error when communicating with blockchain provider.
     ///
     /// This wraps [`RpcError`] for blockchain provider failures during
@@ -162,5 +184,21 @@ impl BlockWindowError {
     /// Create a `SerializationError` from a serde_json error.
     pub fn serialization_error(source: serde_json::Error) -> Self {
         BlockWindowError::SerializationError { source }
+    }
+
+    /// Create a `NonMonotonicTimestamps` error from an inconsistent pair of
+    /// (block, timestamp) observations.
+    pub fn non_monotonic_timestamps(
+        earlier_block: BlockNumber,
+        later_block: BlockNumber,
+        earlier_ts: UnixTimestamp,
+        later_ts: UnixTimestamp,
+    ) -> Self {
+        BlockWindowError::NonMonotonicTimestamps {
+            earlier_block,
+            later_block,
+            earlier_ts,
+            later_ts,
+        }
     }
 }
