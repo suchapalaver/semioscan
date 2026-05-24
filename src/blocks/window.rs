@@ -548,58 +548,20 @@ impl<P: Provider> BlockWindowCalculator<P> {
         let span = spans::block_range_for_timestamps(start_ts.as_u64(), end_ts.as_u64());
         let _guard = span.enter();
 
-        if start_ts > end_ts {
-            return Err(BlockWindowError::invalid_timestamp_range(start_ts, end_ts));
-        }
-
-        let genesis_ts = self
-            .bounds_memo
-            .get_or_fetch_genesis(|| self.get_block_timestamp(0))
-            .await?;
-
-        let (latest_block, latest_ts) = self
-            .bounds_memo
-            .get_or_fetch_head(|| async {
-                let latest_block = self
-                    .provider
-                    .get_block_number()
-                    .await
-                    .map_err(RpcError::get_block_number_failed)?;
-                let latest_ts = if latest_block == 0 {
-                    genesis_ts
-                } else {
-                    self.get_block_timestamp(latest_block).await?
-                };
-                Ok((latest_block, latest_ts))
-            })
-            .await?;
-
-        info!(
-            start_ts = %start_ts,
-            end_ts = %end_ts,
-            latest_block,
-            "Resolving timestamp range to block range"
-        );
-
-        let (start_block, end_block) = compute_block_range_given_bounds(
+        block_range_for_timestamps_with(
+            &self.bounds_memo,
             start_ts,
             end_ts,
-            latest_block,
-            genesis_ts,
-            latest_ts,
             |n| self.get_block_timestamp(n),
+            || async {
+                self.provider
+                    .get_block_number()
+                    .await
+                    .map_err(RpcError::get_block_number_failed)
+                    .map_err(BlockWindowError::from)
+            },
         )
-        .await?;
-
-        info!(
-            start_ts = %start_ts,
-            end_ts = %end_ts,
-            start_block,
-            end_block,
-            "Resolved timestamp range to block range"
-        );
-
-        Ok((start_block, end_block))
+        .await
     }
 
     /// Gets (or computes and caches) the daily block window for a specific chain and date
@@ -863,6 +825,75 @@ where
     } else {
         find_last_at_or_before_with(end_ts, latest_block, &mut fetch_ts).await?
     };
+
+    Ok((start_block, end_block))
+}
+
+/// Memo-aware resolution of an inclusive timestamp range to its inclusive
+/// block range. Pulled out of [`BlockWindowCalculator::block_range_for_timestamps`]
+/// so the full path — input validation, genesis/head memoization via
+/// [`ChainBoundsMemo`], non-monotonic detection, and binary search — can be
+/// exercised in tests without a live RPC.
+///
+/// `fetch_ts(0)` supplies the genesis timestamp, `fetch_latest_block_number()`
+/// supplies the chain head's block number, and `fetch_ts(latest_block)`
+/// supplies the head's timestamp. The production path wires
+/// `self.get_block_timestamp` and `self.provider.get_block_number` through.
+async fn block_range_for_timestamps_with<F, FtFut, G, GnFut>(
+    bounds_memo: &ChainBoundsMemo,
+    start_ts: UnixTimestamp,
+    end_ts: UnixTimestamp,
+    mut fetch_ts: F,
+    fetch_latest_block_number: G,
+) -> Result<(BlockNumber, BlockNumber), BlockWindowError>
+where
+    F: FnMut(BlockNumber) -> FtFut,
+    FtFut: std::future::Future<Output = Result<UnixTimestamp, BlockWindowError>>,
+    G: FnOnce() -> GnFut,
+    GnFut: std::future::Future<Output = Result<BlockNumber, BlockWindowError>>,
+{
+    if start_ts > end_ts {
+        return Err(BlockWindowError::invalid_timestamp_range(start_ts, end_ts));
+    }
+
+    let genesis_ts = bounds_memo.get_or_fetch_genesis(|| fetch_ts(0)).await?;
+
+    let (latest_block, latest_ts) = bounds_memo
+        .get_or_fetch_head(|| async {
+            let latest_block = fetch_latest_block_number().await?;
+            let latest_ts = if latest_block == 0 {
+                genesis_ts
+            } else {
+                fetch_ts(latest_block).await?
+            };
+            Ok((latest_block, latest_ts))
+        })
+        .await?;
+
+    info!(
+        start_ts = %start_ts,
+        end_ts = %end_ts,
+        latest_block,
+        "Resolving timestamp range to block range"
+    );
+
+    let (start_block, end_block) = compute_block_range_given_bounds(
+        start_ts,
+        end_ts,
+        latest_block,
+        genesis_ts,
+        latest_ts,
+        fetch_ts,
+    )
+    .await?;
+
+    info!(
+        start_ts = %start_ts,
+        end_ts = %end_ts,
+        start_block,
+        end_block,
+        "Resolved timestamp range to block range"
+    );
 
     Ok((start_block, end_block))
 }
@@ -1508,6 +1539,155 @@ mod tests {
                 2,
                 "TTL=ZERO must skip memoization"
             );
+        }
+    }
+
+    /// End-to-end tests for the memo-aware wiring in
+    /// [`block_range_for_timestamps_with`] — the closures inside
+    /// [`BlockWindowCalculator::block_range_for_timestamps`] are reachable
+    /// today only by running against a live RPC. These tests drive that
+    /// path via the closure-injected helper using an in-memory fixture so
+    /// the wiring (genesis fetch → head fetch → bounds-aware binary search)
+    /// is exercised under `cargo test`.
+    mod wiring {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        type BoxedTsFut = std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<UnixTimestamp, BlockWindowError>>>,
+        >;
+        type BoxedHeadFut = std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<BlockNumber, BlockWindowError>>>,
+        >;
+
+        /// Records each block requested in `log`, then returns
+        /// `timestamps[block]`. Lets tests count how many times the
+        /// underlying timestamp fetcher was invoked for any given block.
+        fn counting_fetch_ts(
+            timestamps: Vec<i64>,
+            log: Arc<StdMutex<Vec<BlockNumber>>>,
+        ) -> impl FnMut(BlockNumber) -> BoxedTsFut {
+            move |n: BlockNumber| {
+                let ts = timestamps[n as usize];
+                let log = log.clone();
+                Box::pin(async move {
+                    log.lock().expect("test log mutex poisoned").push(n);
+                    Ok(UnixTimestamp(ts))
+                })
+            }
+        }
+
+        /// Mirrors `self.provider.get_block_number()` and increments
+        /// `counter` on each invocation.
+        fn counting_fetch_head(
+            latest: BlockNumber,
+            counter: Arc<AtomicUsize>,
+        ) -> impl FnOnce() -> BoxedHeadFut {
+            move || {
+                Box::pin(async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(latest)
+                })
+            }
+        }
+
+        #[tokio::test]
+        async fn bounds_memoized_across_two_calls_within_ttl() {
+            // Five-block monotonic chain. Two back-to-back resolutions
+            // within the default TTL should collapse the genesis+head
+            // probes from 2·2 into a single pair.
+            //
+            // Both windows are chosen so that the bound-overlap short-circuits
+            // in `compute_block_range_given_bounds` fire instead of the
+            // binary search — that isolates the memo-bootstrap fetches
+            // (block 0 + block `latest`) from the binary-search probes,
+            // which are not memoized and would otherwise re-probe both
+            // bookends during their bisection.
+            let timestamps = vec![1000, 1100, 1200, 1300, 1400];
+            let latest: BlockNumber = 4;
+            let bounds_memo = ChainBoundsMemo::new(DEFAULT_HEAD_TTL);
+
+            let log = Arc::new(StdMutex::new(Vec::<BlockNumber>::new()));
+            let head_counter = Arc::new(AtomicUsize::new(0));
+
+            // First call covers the full chain — both bounds clamp to the
+            // chain extremes without running the binary search. Only the
+            // memo bootstrap (genesis + head) hits `fetch_ts`.
+            let (s1, e1) = block_range_for_timestamps_with(
+                &bounds_memo,
+                UnixTimestamp(500),
+                UnixTimestamp(9999),
+                counting_fetch_ts(timestamps.clone(), log.clone()),
+                counting_fetch_head(latest, head_counter.clone()),
+            )
+            .await
+            .unwrap();
+            assert_eq!((s1, e1), (0, latest));
+
+            // Second call lies strictly past chain head: the `start_ts >
+            // latest_ts` short-circuit fires using the memoized `latest_ts`
+            // (1400). The returned (latest, latest) proves the cached head
+            // was read back, not just written.
+            let (s2, e2) = block_range_for_timestamps_with(
+                &bounds_memo,
+                UnixTimestamp(2000),
+                UnixTimestamp(3000),
+                counting_fetch_ts(timestamps, log.clone()),
+                counting_fetch_head(latest, head_counter.clone()),
+            )
+            .await
+            .unwrap();
+            assert_eq!((s2, e2), (latest, latest));
+
+            // The memo collapses the four genesis+head probes that the
+            // naive implementation would issue (2 per call) into a single
+            // pair, in the order genesis-then-head.
+            let calls = log.lock().unwrap();
+            assert_eq!(
+                calls.as_slice(),
+                &[0u64, latest],
+                "memo must collapse genesis+head fetches across calls within TTL (got: {calls:?})"
+            );
+            assert_eq!(
+                head_counter.load(Ordering::SeqCst),
+                1,
+                "head block number must be fetched once within TTL"
+            );
+        }
+
+        #[tokio::test]
+        async fn single_block_chain_reuses_genesis_for_head() {
+            // Single-block chain (latest_block == 0). The head closure
+            // must reuse the memoized genesis timestamp instead of
+            // refetching block 0; a regression that drops the
+            // `latest_block == 0` short-circuit shows up here as a second
+            // fetch of block 0.
+            let timestamps = vec![1500];
+            let latest: BlockNumber = 0;
+            let bounds_memo = ChainBoundsMemo::new(DEFAULT_HEAD_TTL);
+
+            let log = Arc::new(StdMutex::new(Vec::<BlockNumber>::new()));
+            let head_counter = Arc::new(AtomicUsize::new(0));
+
+            let (s, e) = block_range_for_timestamps_with(
+                &bounds_memo,
+                UnixTimestamp(1000),
+                UnixTimestamp(2000),
+                counting_fetch_ts(timestamps, log.clone()),
+                counting_fetch_head(latest, head_counter.clone()),
+            )
+            .await
+            .unwrap();
+            assert_eq!((s, e), (0, 0));
+
+            let calls = log.lock().unwrap();
+            assert_eq!(
+                calls.as_slice(),
+                &[0u64],
+                "block 0 must be fetched exactly once for a single-block chain (calls: {calls:?})"
+            );
+            assert_eq!(head_counter.load(Ordering::SeqCst), 1);
         }
     }
 }
