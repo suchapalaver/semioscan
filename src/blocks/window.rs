@@ -606,9 +606,11 @@ impl<P: Provider> BlockWindowCalculator<P> {
     /// fetched by either method amortizes subsequent
     /// [`Self::get_daily_window`] calls within the TTL — long-cold-cache
     /// backfills issue a single `eth_blockNumber` instead of one per uncached
-    /// day. The reuse from `get_daily_window` to
-    /// `block_range_for_timestamps` is partial: the latter additionally
-    /// needs the head's timestamp, which `get_daily_window` does not fetch.
+    /// day. The reverse direction is partial: a head populated by
+    /// [`Self::get_daily_window`] lacks the timestamp that
+    /// [`Self::block_range_for_timestamps`] needs, so the next BR4T call
+    /// refetches the full `(block, ts)` pair rather than reusing the cached
+    /// block number.
     ///
     /// # Arguments
     /// * `chain` - The named chain for which to calculate the block window
@@ -898,10 +900,12 @@ where
 ///
 /// Storage is shared with [`ChainBoundsMemo::get_or_fetch_head`]: a head
 /// populated here is reused by subsequent
-/// [`BlockWindowCalculator::get_daily_window`] calls within the TTL, and
-/// reused as far as the block number goes by
-/// [`BlockWindowCalculator::block_range_for_timestamps`] — that method then
-/// refetches the timestamp it needs.
+/// [`BlockWindowCalculator::get_daily_window`] calls within the TTL.
+/// [`BlockWindowCalculator::block_range_for_timestamps`] treats a partial
+/// entry left here as a miss and refetches the full `(block, ts)` pair —
+/// the closure it supplies to [`ChainBoundsMemo::get_or_fetch_head`] fetches
+/// both, so the partial block number is discarded rather than upgraded in
+/// place.
 async fn get_daily_window_with<F, FtFut, G, GnFut>(
     bounds_memo: &ChainBoundsMemo,
     cache: &dyn BlockWindowCache,
