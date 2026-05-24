@@ -369,7 +369,11 @@ impl<P: Provider> BlockWindowCalculator<P> {
     ///   reorg recovery: tip-adjacent ranges short-circuit through
     ///   `start_ts > latest_ts` / `end_ts >= latest_ts` using the cached
     ///   head, so blocks produced during the TTL window can be silently
-    ///   excluded.
+    ///   excluded. The same gate also drives the daily-window cache: a
+    ///   `(chain, date)` whose `end_ts_exclusive` extends at or past the
+    ///   memoized `latest_ts` is not persisted to the
+    ///   [`BlockWindowCache`], so a longer head TTL widens the set of
+    ///   dates that recompute their binary search on every call.
     /// - At TTL expiry, concurrent callers funnel through a single
     ///   in-flight head fetch. This avoids a thundering-herd against the
     ///   RPC provider, but it also means a slow provider stalls every
@@ -619,6 +623,17 @@ impl<P: Provider> BlockWindowCalculator<P> {
     /// [`Self::block_range_for_timestamps`] needs, so the next BR4T call
     /// refetches the full `(block, ts)` pair rather than reusing the cached
     /// block number.
+    ///
+    /// Dates whose `start_ts` is strictly past the memoized chain-head
+    /// timestamp, or whose `end_ts_exclusive` extends at or past it, are
+    /// **not** persisted to the `BlockWindowCache`. Such windows depend on
+    /// future chain state that the cache key `(chain, date)` cannot
+    /// disambiguate: a window computed against head `H` would silently
+    /// shadow the correct window once the chain advanced past `H` into the
+    /// day's range. The no-cache gate fires only when a full memo entry is
+    /// available (populated by a prior [`Self::block_range_for_timestamps`]
+    /// call within the TTL); a cold-memo daily-window call lacks the
+    /// timestamp and still caches as before.
     ///
     /// # Arguments
     /// * `chain` - The named chain for which to calculate the block window
@@ -1037,7 +1052,9 @@ where
         debug!(
             chain = %chain,
             date = %date,
-            "Skipping cache insert: day touches chain tip and may yet gain or lose blocks"
+            "Skipping cache insert: window touches or extends past chain tip — \
+             future blocks may shift the day's range, and the (chain, date) \
+             cache key cannot disambiguate which head was current"
         );
     } else if let Err(e) = cache.insert(key, window.clone()).await {
         debug!(error = %e, "Failed to cache block window (continuing anyway)");
@@ -2403,6 +2420,63 @@ mod tests {
                 cache.stats().await.entries,
                 1,
                 "cold-memo historical date must still populate the cache"
+            );
+        }
+
+        #[tokio::test]
+        async fn daily_window_start_ts_equals_latest_ts_runs_search_and_does_not_cache() {
+            // Fence-post case: `start_ts == latest_ts` exactly. The
+            // past-tip branch (`start_ts > latest_ts`) must NOT fire —
+            // the day begins exactly at the chain head, so block
+            // `latest` is the first block of the day and the binary
+            // search must produce an honest `start_block`. But the
+            // tip-touching gate (`end_ts_exclusive.pred() >= latest_ts`)
+            // must fire and skip the cache insert, since the day is
+            // still partial.
+            //
+            // 2025-01-01 UTC: start_ts=1_735_689_600, end_ts_exclusive=1_735_776_000.
+            // Memoized latest_ts = 1_735_689_600 (== start_ts).
+            let timestamps = vec![
+                1_735_689_400, // block 0 — before the day
+                1_735_689_500, // block 1 — before the day
+                1_735_689_600, // block 2 — first second of the day (== latest_ts, head)
+            ];
+            let bounds_memo = ChainBoundsMemo::new(DEFAULT_HEAD_TTL);
+            *bounds_memo.head.lock().await = Some(HeadEntry {
+                fetched_at: Instant::now(),
+                latest_block: 2,
+                latest_ts: Some(UnixTimestamp(1_735_689_600)),
+            });
+
+            let cache = crate::blocks::cache::MemoryCache::new();
+            let log = Arc::new(StdMutex::new(Vec::<BlockNumber>::new()));
+            let head_counter = Arc::new(AtomicUsize::new(0));
+            let date = NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
+
+            let window = get_daily_window_with(
+                &bounds_memo,
+                &cache,
+                NamedChain::Arbitrum,
+                date,
+                counting_fetch_ts(timestamps, log.clone()),
+                counting_fetch_head(2, head_counter.clone()),
+            )
+            .await
+            .unwrap();
+
+            // Block 2 is the first block at ts >= start_ts, so start_block = 2.
+            // No block has ts > end_ts_exclusive.pred(), so end_block = latest = 2.
+            assert_eq!((window.start_block, window.end_block), (2, 2));
+            assert!(
+                !log.lock().unwrap().is_empty(),
+                "binary search must still run when start_ts == latest_ts — \
+                 the past-tip short-circuit fires only on strictly past dates"
+            );
+            assert_eq!(
+                cache.stats().await.entries,
+                0,
+                "day whose start coincides with the chain tip is still partial \
+                 and must not be cached"
             );
         }
     }
