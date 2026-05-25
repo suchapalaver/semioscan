@@ -34,6 +34,7 @@ mod gas;
 pub mod price;
 pub mod provider;
 mod retrieval;
+mod scan;
 mod tracing;
 pub mod transport;
 mod types;

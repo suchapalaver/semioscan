@@ -67,12 +67,12 @@ use alloy_transport::TransportError;
 use futures::future::join_all;
 use op_alloy_network::Optimism;
 use std::{borrow::Cow, error::Error as StdError, sync::Arc};
-use tokio::time::sleep;
-use tracing::{error, info, trace, warn, Instrument};
+use tracing::{error, info, warn, Instrument};
 
 use crate::config::SemioscanConfig;
 use crate::events::definitions::Transfer;
 use crate::gas::adapter::{EthereumReceiptAdapter, OptimismReceiptAdapter, ReceiptAdapter};
+use crate::scan::LogScanner;
 use crate::tracing::spans;
 use crate::types::gas::{GasAmount, GasPrice};
 
@@ -539,159 +539,137 @@ where
         async {
             let mut result =
                 CombinedDataResult::new(chain, from_address, to_address, token_address);
-            let mut current_block = from_block;
 
-            // Get config values for this chain
-            let max_block_range = self.config.get_max_block_range(chain);
-            let rate_limit = self.config.get_rate_limit_delay(chain);
             let serial_lookup_fallback_attempts =
                 self.config.get_serial_lookup_fallback_attempts(chain);
 
-            while current_block <= to_block {
-                let chunk_end =
-                    std::cmp::min(current_block + max_block_range.as_u64() - 1, to_block);
+            let filter_template = GasCalculationCore::create_transfer_filter(
+                token_address,
+                from_address,
+                to_address,
+            );
 
-                let filter = GasCalculationCore::create_transfer_filter(
-                    current_block,
-                    chunk_end,
-                    token_address,
-                    from_address,
-                    to_address,
-                );
+            let scanner = LogScanner::<_, N>::new(Arc::clone(&self.provider), self.config.clone());
+            let logs: Vec<RpcLog> = scanner
+                .scan::<RetrievalError, _>(
+                    chain,
+                    filter_template,
+                    from_block,
+                    to_block,
+                    |e| {
+                        Some(RetrievalError::Rpc(crate::errors::RpcError::get_logs_failed(
+                            format!(
+                                "get_logs for blocks {from_block}-{to_block} on {chain:?}"
+                            ),
+                            e,
+                        )))
+                    },
+                )
+                .await?;
 
-                trace!(?filter, current_block, chunk_end, "Fetching logs");
-                let logs: Vec<RpcLog> = self.provider.get_logs(&filter).await.map_err(|e| {
-                    RetrievalError::Rpc(crate::errors::RpcError::get_logs_failed(
-                        format!(
-                            "get_logs for blocks {current_block}-{chunk_end} on {chain:?}"
-                        ),
-                        e,
-                    ))
-                })?;
-                trace!(
-                    logs_count = logs.len(),
-                    current_block,
-                    chunk_end,
-                    "Fetched logs"
-                );
+            let mut log_entries = Vec::with_capacity(logs.len());
+            for rpc_log_entry in &logs {
+                match Transfer::decode_log(&rpc_log_entry.inner) {
+                    Ok(transfer_event_data) => {
+                        let tx_hash = match rpc_log_entry.transaction_hash {
+                            Some(hash) => hash,
+                            None => {
+                                error!("Missing transaction hash in log entry");
+                                continue;
+                            }
+                        };
+                        let block_number = match rpc_log_entry.block_number {
+                            Some(num) => num,
+                            None => {
+                                error!("Missing block number in log entry");
+                                continue;
+                            }
+                        };
 
-                // First pass: Decode all logs and collect entries for batch fetching
-                let mut log_entries = Vec::with_capacity(logs.len());
-                for rpc_log_entry in &logs {
-                    match Transfer::decode_log(&rpc_log_entry.inner) {
-                        Ok(transfer_event_data) => {
-                            let tx_hash = match rpc_log_entry.transaction_hash {
-                                Some(hash) => hash,
-                                None => {
-                                    error!("Missing transaction hash in log entry");
-                                    continue;
-                                }
-                            };
-                            let block_number = match rpc_log_entry.block_number {
-                                Some(num) => num,
-                                None => {
-                                    error!("Missing block number in log entry");
-                                    continue;
-                                }
-                            };
-
-                            info!(
-                                ?chain, ?from_address, ?to_address, ?token_address,
-                                amount = ?transfer_event_data.value,
-                                block = block_number,
-                                ?tx_hash,
-                                "Decoded Transfer event for batch processing"
-                            );
-
-                            log_entries.push(LogBatchEntry {
-                                tx_hash,
-                                block_number,
-                                transfer_value: transfer_event_data.value,
-                            });
-                        }
-                        Err(e) => {
-                            error!(error = %e, log_data = ?rpc_log_entry.data(), log_topics = ?rpc_log_entry.topics(), "Failed to decode Transfer log. Skipping log.");
-                            // Continue with other logs
-                        }
-                    }
-                }
-
-                // Second pass: Batch fetch all transaction and receipt data
-                let batch_results = self.batch_fetch_tx_data(chain, &log_entries, adapter).await;
-
-                // Process batch results
-                let mut batch_failures = Vec::new();
-                for batch_result in batch_results {
-                    match batch_result {
-                        Ok(data) => {
-                            result.add_transaction_data(data);
-                        }
-                        Err(failure) => {
-                            batch_failures.push(failure);
-                        }
-                    }
-                }
-
-                if !batch_failures.is_empty() {
-                    if serial_lookup_fallback_attempts == 0 {
-                        warn!(
-                            failed_lookups = batch_failures.len(),
-                            "Batch combined lookups failed and serial fallback is disabled for this chain"
+                        info!(
+                            ?chain, ?from_address, ?to_address, ?token_address,
+                            amount = ?transfer_event_data.value,
+                            block = block_number,
+                            ?tx_hash,
+                            "Decoded Transfer event for batch processing"
                         );
-                    } else {
-                        warn!(
-                            failed_lookups = batch_failures.len(),
-                            max_attempts_per_lookup = serial_lookup_fallback_attempts,
-                            "Retrying failed combined lookups serially after batch pass"
-                        );
+
+                        log_entries.push(LogBatchEntry {
+                            tx_hash,
+                            block_number,
+                            transfer_value: transfer_event_data.value,
+                        });
                     }
-                }
-
-                // The fallback pass is intentionally sequential across failures to avoid
-                // reproducing the original burst pattern against the provider.
-                for batch_failure in batch_failures {
-                    let (retry_result, fallback_attempts) = self
-                        .retry_failed_tx_data(
-                            chain,
-                            batch_failure,
-                            serial_lookup_fallback_attempts,
-                            adapter,
-                        )
-                        .await;
-                    result
-                        .retrieval_metadata
-                        .record_fallback_attempts(fallback_attempts);
-
-                    match retry_result {
-                        Ok(data) => {
-                            result.retrieval_metadata.record_fallback_recovery();
-                            result.add_transaction_data(data);
-                        }
-                        Err(failure) => {
-                            log_combined_data_skip(
-                                &failure,
-                                chain,
-                                from_address,
-                                to_address,
-                                token_address,
-                                from_block,
-                                to_block,
-                            );
-                            result.retrieval_metadata.record_partial_failure(failure);
-                        }
-                    }
-                }
-
-                current_block = chunk_end + 1;
-
-                // Apply rate limiting if configured for this chain
-                if let Some(delay) = rate_limit {
-                    if current_block <= to_block {
-                        trace!(?chain, ?delay, "Applying rate limit delay");
-                        sleep(delay).await;
+                    Err(e) => {
+                        error!(error = %e, log_data = ?rpc_log_entry.data(), log_topics = ?rpc_log_entry.topics(), "Failed to decode Transfer log. Skipping log.");
                     }
                 }
             }
+
+            let batch_results = self.batch_fetch_tx_data(chain, &log_entries, adapter).await;
+
+            let mut batch_failures = Vec::new();
+            for batch_result in batch_results {
+                match batch_result {
+                    Ok(data) => {
+                        result.add_transaction_data(data);
+                    }
+                    Err(failure) => {
+                        batch_failures.push(failure);
+                    }
+                }
+            }
+
+            if !batch_failures.is_empty() {
+                if serial_lookup_fallback_attempts == 0 {
+                    warn!(
+                        failed_lookups = batch_failures.len(),
+                        "Batch combined lookups failed and serial fallback is disabled for this chain"
+                    );
+                } else {
+                    warn!(
+                        failed_lookups = batch_failures.len(),
+                        max_attempts_per_lookup = serial_lookup_fallback_attempts,
+                        "Retrying failed combined lookups serially after batch pass"
+                    );
+                }
+            }
+
+            // The fallback pass is intentionally sequential across failures to avoid
+            // reproducing the original burst pattern against the provider.
+            for batch_failure in batch_failures {
+                let (retry_result, fallback_attempts) = self
+                    .retry_failed_tx_data(
+                        chain,
+                        batch_failure,
+                        serial_lookup_fallback_attempts,
+                        adapter,
+                    )
+                    .await;
+                result
+                    .retrieval_metadata
+                    .record_fallback_attempts(fallback_attempts);
+
+                match retry_result {
+                    Ok(data) => {
+                        result.retrieval_metadata.record_fallback_recovery();
+                        result.add_transaction_data(data);
+                    }
+                    Err(failure) => {
+                        log_combined_data_skip(
+                            &failure,
+                            chain,
+                            from_address,
+                            to_address,
+                            token_address,
+                            from_block,
+                            to_block,
+                        );
+                        result.retrieval_metadata.record_partial_failure(failure);
+                    }
+                }
+            }
+
             info!(
                 ?chain,
                 %from_address,
