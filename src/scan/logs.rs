@@ -22,51 +22,57 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{debug, error, Instrument};
 
+use crate::config::policy::ScanPolicy;
 use crate::config::SemioscanConfig;
 
 /// Block-range log scanner that chunks `eth_getLogs` calls and applies
 /// chain-specific rate limiting.
 ///
-/// The chunk size and inter-chunk delay are read from [`SemioscanConfig`] per
-/// chain. Per-chunk error policy is supplied as a closure to
+/// The chunk size and inter-chunk delay are resolved per chain through a
+/// [`ScanPolicy`]. Per-chunk error policy is supplied as a closure to
 /// [`LogScanner::scan`]: returning `None` continues with the next chunk,
 /// returning `Some(err)` aborts the scan with that error.
+///
+/// `S` defaults to [`SemioscanConfig`], so existing call sites that pass a
+/// full config through unchanged keep compiling; callers that only have a
+/// scan policy in hand can supply any other `ScanPolicy` implementation.
 ///
 /// This type is crate-internal. External consumers reach the same
 /// functionality through [`crate::events::EventScanner`] (which fixes the
 /// policy to continue-on-error) or through `GasCostCalculator` /
 /// `CombinedCalculator` / `PriceCalculator`, each of which picks the
 /// per-chunk error policy that matches its domain.
-pub struct LogScanner<P, N: Network = Ethereum> {
+pub struct LogScanner<P, N: Network = Ethereum, S: ScanPolicy = SemioscanConfig> {
     provider: P,
-    config: SemioscanConfig,
+    policy: S,
     _network: PhantomData<fn() -> N>,
 }
 
-impl<P, N> LogScanner<P, N>
+impl<P, N, S> LogScanner<P, N, S>
 where
     N: Network,
     P: Provider<N>,
+    S: ScanPolicy,
 {
-    /// Create a new scanner over the given provider and config.
-    pub fn new(provider: P, config: SemioscanConfig) -> Self {
+    /// Create a new scanner over the given provider and scan policy.
+    pub fn new(provider: P, policy: S) -> Self {
         Self {
             provider,
-            config,
+            policy,
             _network: PhantomData,
         }
     }
 
     /// Scan `start_block..=end_block` for logs matching `filter_template`,
-    /// using chunk size and rate-limit delay resolved from [`SemioscanConfig`]
+    /// using chunk size and rate-limit delay resolved from the [`ScanPolicy`]
     /// for `chain`. Tracing events emitted by the scan are tagged with
     /// `chain = <chain>` via a parent span so per-chain dashboards can filter
     /// them.
     ///
-    /// The block range is split into chunks of `config.get_max_block_range(chain)`
+    /// The block range is split into chunks of `policy.scan_config(chain).max_block_range`
     /// blocks. For each chunk, `filter_template` is cloned and stamped with the
     /// chunk's `from_block`/`to_block`, then `eth_getLogs` is issued. Between
-    /// chunks, `config.get_rate_limit_delay(chain)` is applied (when set).
+    /// chunks, `policy.scan_config(chain).rate_limit_delay` is applied (when set).
     ///
     /// On a per-chunk transport error, `on_chunk_error` is called with the
     /// failing chunk's `from_block` and `to_block` so the caller can attribute
@@ -81,8 +87,8 @@ where
     ///
     /// # Panics
     ///
-    /// Panics if `config.get_max_block_range(chain)` returns a zero
-    /// `MaxBlockRange` — i.e. the caller built the config with
+    /// Panics if the policy returns a zero `MaxBlockRange` for `chain` —
+    /// i.e. the caller built the config with
     /// `SemioscanConfigBuilder::chain_max_blocks(chain, 0)`. A zero chunk size
     /// would otherwise cause the loop to spin without making progress.
     pub async fn scan<E, F>(
@@ -96,12 +102,13 @@ where
     where
         F: FnMut(BlockNumber, BlockNumber, TransportError) -> Option<E>,
     {
-        let chunk_size = self.config.get_max_block_range(chain).as_u64();
+        let scan_cfg = self.policy.scan_config(chain);
+        let chunk_size = scan_cfg.max_block_range.as_u64();
         assert!(
             chunk_size > 0,
-            "chunk size for {chain:?} must be > 0; got 0 from SemioscanConfig"
+            "chunk size for {chain:?} must be > 0; got 0 from ScanPolicy"
         );
-        let rate_limit = self.config.get_rate_limit_delay(chain);
+        let rate_limit = scan_cfg.rate_limit_delay;
 
         self.scan_raw(
             chunk_size,

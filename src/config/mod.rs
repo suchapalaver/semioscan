@@ -46,6 +46,7 @@ use alloy_chains::NamedChain;
 use crate::types::config::MaxBlockRange;
 
 pub mod constants;
+pub mod policy;
 
 /// Configuration for semioscan operations
 ///
@@ -518,6 +519,23 @@ impl SemioscanConfigBuilder {
     /// ```
     pub fn build(self) -> SemioscanConfig {
         self.config
+    }
+}
+
+impl policy::ScanPolicy for SemioscanConfig {
+    fn scan_config(&self, chain: NamedChain) -> policy::ScanConfig {
+        policy::ScanConfig {
+            max_block_range: self.get_max_block_range(chain),
+            rate_limit_delay: self.get_rate_limit_delay(chain),
+        }
+    }
+}
+
+impl policy::LookupPolicy for SemioscanConfig {
+    fn lookup_config(&self, chain: NamedChain) -> policy::LookupConfig {
+        policy::LookupConfig {
+            serial_lookup_fallback_attempts: self.get_serial_lookup_fallback_attempts(chain),
+        }
     }
 }
 
