@@ -381,7 +381,21 @@ impl ProviderPoolBuilder {
         self
     }
 
-    /// Set the default rate limit for all providers
+    /// Set the default requests-per-second budget applied to every endpoint
+    /// in the pool that does not carry its own [`ChainEndpoint::rate_limit`].
+    ///
+    /// **Interaction with [`with_rpc_policy`](Self::with_rpc_policy).** The
+    /// per-second budget and a policy-supplied `rate_limit_delay` are not
+    /// stacked on the wire — each endpoint ends up with at most one
+    /// rate-limit layer, and the per-second axis wins. A chain that has
+    /// both a builder-level (or endpoint-level) requests-per-second and a
+    /// policy `rate_limit_delay` is paced by requests-per-second only; the
+    /// policy's per-chain minimum gap is dropped at pool construction and
+    /// a `tracing::warn!` fires for the affected endpoint. If the per-chain
+    /// minimum gap is the one that matters, set the per-second budget only
+    /// on the endpoints that need it via
+    /// [`ChainEndpoint::with_rate_limit`] instead of this pool-wide default,
+    /// and the policy delay will apply to the remaining chains.
     #[must_use]
     pub fn with_rate_limit(mut self, requests_per_second: u32) -> Self {
         self.default_rate_limit = Some(requests_per_second);
@@ -409,6 +423,19 @@ impl ProviderPoolBuilder {
     /// a timeout for a chain. There is no pool-level default for the
     /// minimum-delay pacing axis, so a chain with no endpoint `min_delay`
     /// and no policy `rate_limit_delay` simply runs unpaced.
+    ///
+    /// **Interaction with [`with_rate_limit`](Self::with_rate_limit) and
+    /// [`ChainEndpoint::with_rate_limit`].** A policy's `rate_limit_delay`
+    /// and a requests-per-second budget on the same chain are not stacked
+    /// on the wire: each endpoint installs at most one rate-limit layer
+    /// and the per-second axis wins. If `with_rate_limit(rps)` or an
+    /// endpoint-level `rate_limit` is set on a chain that the policy also
+    /// supplies a `rate_limit_delay` for, the policy's per-chain minimum
+    /// gap is dropped at construction and a `tracing::warn!` fires for the
+    /// affected endpoint. To keep both knobs effective across the pool,
+    /// move the per-second budget off this pool-wide default and onto the
+    /// chains that need it via [`ChainEndpoint::with_rate_limit`], leaving
+    /// the policy delay in place for the rest.
     #[must_use]
     pub fn with_rpc_policy<P: RpcPolicy>(mut self, policy: &P) -> Self {
         for endpoint in &self.endpoints {
