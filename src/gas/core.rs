@@ -10,6 +10,7 @@ use alloy_rpc_types::{Filter, Log, TransactionTrait};
 use alloy_sol_types::SolEvent;
 use op_alloy_network::Optimism;
 
+use crate::config::policy::ScanPolicy;
 use crate::errors::{GasCalculationError, RpcError};
 use crate::events::definitions::{Approval, Transfer};
 use crate::gas::adapter::{EthereumReceiptAdapter, OptimismReceiptAdapter, ReceiptAdapter};
@@ -253,7 +254,7 @@ where
             info!(
                 event_type = event_type.name(),
                 total_blocks = to_block.saturating_sub(from_block) + 1,
-                max_block_range = self.config.get_max_block_range(chain).as_u64(),
+                max_block_range = self.config.scan_config(chain).max_block_range.as_u64(),
                 "Starting log processing"
             );
 

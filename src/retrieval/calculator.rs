@@ -69,6 +69,7 @@ use op_alloy_network::Optimism;
 use std::{borrow::Cow, error::Error as StdError, sync::Arc};
 use tracing::{error, info, warn, Instrument};
 
+use crate::config::policy::LookupPolicy;
 use crate::config::SemioscanConfig;
 use crate::events::definitions::Transfer;
 use crate::gas::adapter::{EthereumReceiptAdapter, OptimismReceiptAdapter, ReceiptAdapter};
@@ -540,8 +541,10 @@ where
             let mut result =
                 CombinedDataResult::new(chain, from_address, to_address, token_address);
 
-            let serial_lookup_fallback_attempts =
-                self.config.get_serial_lookup_fallback_attempts(chain);
+            let serial_lookup_fallback_attempts = self
+                .config
+                .lookup_config(chain)
+                .serial_lookup_fallback_attempts;
 
             let filter_template = GasCalculationCore::create_transfer_filter(
                 token_address,
