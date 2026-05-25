@@ -436,8 +436,14 @@ impl ProviderPoolBuilder {
     }
 }
 
-/// Configuration for a chain endpoint
+/// Configuration for a chain endpoint.
+///
+/// Construct via [`ChainEndpoint::new`] (or one of the preset constructors
+/// such as [`ChainEndpoint::mainnet`]) and the `with_*` setters. The struct
+/// is `#[non_exhaustive]` so additional optional fields can be added in
+/// future releases without forcing struct-literal callers to update.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ChainEndpoint {
     /// The chain this endpoint serves
     pub chain: NamedChain,
