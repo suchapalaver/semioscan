@@ -446,6 +446,36 @@ mod tests {
         tracing::subscriber::set_default(subscriber)
     }
 
+    /// Mirrors `src/scan/logs.rs::tests::parse_events`.
+    fn parse_events(captured: &str) -> Vec<serde_json::Value> {
+        captured
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("tracing line is JSON"))
+            .collect()
+    }
+
+    /// Mirrors `src/scan/logs.rs::tests::find_event`.
+    fn find_event<'a>(events: &'a [serde_json::Value], message: &str) -> &'a serde_json::Value {
+        events
+            .iter()
+            .find(|e| e.pointer("/fields/message").and_then(|m| m.as_str()) == Some(message))
+            .unwrap_or_else(|| panic!("expected event with message {message:?}; got {events:#?}"))
+    }
+
+    /// Mirrors `src/scan/logs.rs::tests::event_runs_in_log_scan`.
+    fn event_runs_in_log_scan(event: &serde_json::Value) -> bool {
+        event
+            .get("spans")
+            .and_then(|s| s.as_array())
+            .map(|spans| {
+                spans
+                    .iter()
+                    .any(|s| s.get("name").and_then(|n| n.as_str()) == Some("log_scan"))
+            })
+            .unwrap_or(false)
+    }
+
     #[tokio::test]
     async fn tracing_is_chain_neutral_and_records_chunk_dimensions() {
         let writer = CapturingWriter::default();
@@ -464,18 +494,28 @@ mod tests {
                 .expect("happy-path chunked fetch must succeed");
         }
 
-        let captured = writer.captured();
-        assert!(
-            !captured.contains("\"chain\""),
-            "fetch_logs_chunked must not tag events with a chain field; got:\n{captured}"
+        let events = parse_events(&writer.captured());
+        for event in &events {
+            assert!(
+                event.pointer("/fields/chain").is_none(),
+                "fetch_logs_chunked event must not carry chain as a direct field: {event}"
+            );
+            assert!(
+                !event_runs_in_log_scan(event),
+                "fetch_logs_chunked must not route through the chain-bearing log_scan span: {event}"
+            );
+        }
+
+        let start = find_event(&events, "Starting log scan");
+        assert_eq!(
+            start.pointer("/fields/chunk_size").and_then(|v| v.as_u64()),
+            Some(100),
+            "start event must record chunk_size for capacity-planning dashboards: {start}"
         );
-        assert!(
-            captured.contains("\"chunk_size\":100"),
-            "start-of-scan event must carry chunk_size for capacity-planning dashboards; got:\n{captured}"
-        );
-        assert!(
-            captured.contains("\"num_chunks\":3"),
-            "start-of-scan event must carry num_chunks for capacity-planning dashboards; got:\n{captured}"
+        assert_eq!(
+            start.pointer("/fields/num_chunks").and_then(|v| v.as_u64()),
+            Some(3),
+            "start event must record num_chunks for capacity-planning dashboards: {start}"
         );
     }
 }

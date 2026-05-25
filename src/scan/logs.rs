@@ -79,9 +79,10 @@ where
     ///
     /// # Panics
     ///
-    /// Panics if `config.get_max_block_range(chain)` is 0 — a zero chunk size
-    /// is a configuration error that would otherwise cause the loop to spin
-    /// without making progress.
+    /// Panics if `config.get_max_block_range(chain)` returns a zero
+    /// `MaxBlockRange` — i.e. the caller built the config with
+    /// `SemioscanConfigBuilder::chain_max_blocks(chain, 0)`. A zero chunk size
+    /// would otherwise cause the loop to spin without making progress.
     pub async fn scan<E, F>(
         &self,
         chain: NamedChain,
@@ -757,6 +758,43 @@ mod tests {
         tracing::subscriber::set_default(subscriber)
     }
 
+    /// Parses captured JSON-line tracing output into one `serde_json::Value`
+    /// per event. Tests use structured field/span inspection instead of
+    /// substring searches so the assertions stay tight under future
+    /// formatter changes or ambient parent spans.
+    fn parse_events(captured: &str) -> Vec<serde_json::Value> {
+        captured
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("tracing line is JSON"))
+            .collect()
+    }
+
+    /// Returns the start-of-scan event, identified by its message field.
+    fn find_event<'a>(events: &'a [serde_json::Value], message: &str) -> &'a serde_json::Value {
+        events
+            .iter()
+            .find(|e| e.pointer("/fields/message").and_then(|m| m.as_str()) == Some(message))
+            .unwrap_or_else(|| panic!("expected event with message {message:?}; got {events:#?}"))
+    }
+
+    /// Returns true iff `event` is run inside a `log_scan` span — the
+    /// chain-bearing span attached by `LogScanner::scan`. Iterates the
+    /// `spans` list directly rather than scanning the raw JSON for the
+    /// substring `"chain"`, which would also match unrelated
+    /// `chain_id`-style fields in future trace shapes.
+    fn event_runs_in_log_scan(event: &serde_json::Value) -> bool {
+        event
+            .get("spans")
+            .and_then(|s| s.as_array())
+            .map(|spans| {
+                spans
+                    .iter()
+                    .any(|s| s.get("name").and_then(|n| n.as_str()) == Some("log_scan"))
+            })
+            .unwrap_or(false)
+    }
+
     #[tokio::test]
     async fn scan_raw_tracing_carries_chunk_size_and_num_chunks_without_chain() {
         let writer = CapturingWriter::default();
@@ -775,18 +813,28 @@ mod tests {
                 .expect("scan_raw happy path");
         }
 
-        let captured = writer.captured();
-        assert!(
-            !captured.contains("\"chain\""),
-            "scan_raw must not emit a chain field; got:\n{captured}"
+        let events = parse_events(&writer.captured());
+        for event in &events {
+            assert!(
+                event.pointer("/fields/chain").is_none(),
+                "scan_raw event must not carry chain as a direct field: {event}"
+            );
+            assert!(
+                !event_runs_in_log_scan(event),
+                "scan_raw event must not run inside a log_scan span: {event}"
+            );
+        }
+
+        let start = find_event(&events, "Starting log scan");
+        assert_eq!(
+            start.pointer("/fields/chunk_size").and_then(|v| v.as_u64()),
+            Some(100),
+            "start event must record chunk_size for capacity planning: {start}"
         );
-        assert!(
-            captured.contains("\"chunk_size\":100"),
-            "scan_raw start event must record chunk_size; got:\n{captured}"
-        );
-        assert!(
-            captured.contains("\"num_chunks\":3"),
-            "scan_raw start event must record num_chunks; got:\n{captured}"
+        assert_eq!(
+            start.pointer("/fields/num_chunks").and_then(|v| v.as_u64()),
+            Some(3),
+            "start event must record num_chunks for capacity planning: {start}"
         );
     }
 
@@ -812,14 +860,23 @@ mod tests {
                 .expect("scan happy path");
         }
 
-        let captured = writer.captured();
+        let events = parse_events(&writer.captured());
+        let start = find_event(&events, "Starting log scan");
         assert!(
-            captured.contains("\"chain\""),
-            "scan must tag events with chain via the log_scan span; got:\n{captured}"
+            event_runs_in_log_scan(start),
+            "scan must enter a log_scan span: {start}"
         );
+
+        let chain_field = start
+            .get("spans")
+            .and_then(|s| s.as_array())
+            .and_then(|spans| spans.iter().find(|s| s.get("name").is_some()))
+            .and_then(|span| span.get("chain"))
+            .and_then(|c| c.as_str())
+            .expect("log_scan span must expose a chain field");
         assert!(
-            captured.to_lowercase().contains("arbitrum"),
-            "chain span field must serialize the supplied NamedChain; got:\n{captured}"
+            chain_field.to_lowercase().contains("arbitrum"),
+            "log_scan span must carry the supplied NamedChain; got {chain_field:?}"
         );
     }
 }

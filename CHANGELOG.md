@@ -27,6 +27,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `fetch_logs_chunked` tracing events no longer tag every chunk with
+  `chain = mainnet`. After the consolidation onto `LogScanner` in #33,
+  the helper supplied `NamedChain::Mainnet` as a sentinel chain key, so
+  per-chain dashboards mis-attributed every chunked fetch to mainnet
+  regardless of which network the caller was scanning. The start-of-scan
+  event also now carries `chunk_size` and `num_chunks` again, restoring
+  the capacity-planning signal operators relied on before #33. Other
+  callers of `LogScanner::scan` (gas, price, retrieval, `EventScanner`)
+  keep their per-chain tracing — the chain field flows from a
+  `log_scan` span attached around the scan future. Closes #35.
 - `GasCache` and `PriceCache` no longer return an over-counted aggregate
   when a query window is narrower than a cached entry. Before, a cache
   holding `[50, 350]` would answer a `[100, 300]` query with the wider
