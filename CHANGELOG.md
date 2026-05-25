@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `BlockWindowCalculator::with_disk_cache` now makes one additional RPC
+  call per chain (per 30 seconds) when `get_daily_window` first runs in
+  a process. This restores disk persistence for daily-window-only
+  callers (see "Fixed"), but means `get_daily_window` against a
+  `with_disk_cache` calculator can now return
+  `BlockWindowError::Rpc(BlockNotFound)` if the chain reorgs out the
+  just-reported head between the two RPC calls — a failure mode 0.14.0
+  removed for daily-window callers. Callers that need persistence
+  across restarts but cannot tolerate this failure should build a
+  `DiskCache` and pass it through `BlockWindowCalculator::new`
+  instead; that path keeps 0.14.0's behavior.
+
+### Fixed
+
+- `BlockWindowCalculator::with_disk_cache` now writes block windows to
+  the cache file for callers that only use `get_daily_window`.
+  Previously, a daily reconciliation backfill or any one-method-per-process
+  consumer paired with this constructor found an empty cache file after
+  every process restart and re-ran the binary search for every date —
+  the constructor's "persistence across restarts" promise silently held
+  only for callers that also used `block_range_for_timestamps`. Other
+  constructors (`new`, `with_memory_cache`, `without_cache`) are
+  unchanged. Closes #18.
+
 ## [0.14.0] - 2026-05-24
 
 ### Breaking Changes
