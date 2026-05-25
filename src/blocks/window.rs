@@ -612,8 +612,8 @@ impl<P: Provider> BlockWindowCalculator<P> {
     /// The `(chain, date)` result is stored in the [`BlockWindowCache`] supplied
     /// to the constructor (disk / memory / no-op). Independently, the chain
     /// head's block number used to bound the binary search is memoized per
-    /// calculator instance via [`ChainBoundsMemo`], with the TTL configurable
-    /// through [`Self::with_head_ttl`] (default [`DEFAULT_HEAD_TTL`]). That
+    /// calculator instance, with the TTL configurable through
+    /// [`Self::with_head_ttl`] (default [`DEFAULT_HEAD_TTL`]). That
     /// memo is shared with [`Self::block_range_for_timestamps`], so the head
     /// fetched by either method amortizes subsequent
     /// [`Self::get_daily_window`] calls within the TTL — long-cold-cache

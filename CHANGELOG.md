@@ -7,16 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-05-24
+
+### Breaking Changes
+
+- `BlockWindowCache` gained a `record_skip_insert` trait method without a
+  default implementation. Downstream implementations of the trait must add
+  the method; in-tree backends (`MemoryCache`, `DiskCache`, `NoOpCache`)
+  already implement it. The method records deliberate cache-insert skips
+  (see the daily-window changes below) into `CacheStats::skip_inserts` so
+  operators can distinguish them from broken inserts; backends that don't
+  track stats may leave the body empty.
+- `CacheStats` gained a `pub skip_inserts: u64` field. Code constructing
+  `CacheStats` with a struct literal must include the field; consumers
+  that read it through accessor methods (`hit_rate`, `Display`) are
+  unaffected.
+
 ### Added
 
 - `BlockWindowCalculator::with_head_ttl(Duration)` — builder method that
-  overrides the TTL used to memoize the chain head for
-  `block_range_for_timestamps`. The default
+  overrides the TTL used to memoize the chain head shared by
+  `block_range_for_timestamps` and `get_daily_window`. The default
   (`DEFAULT_HEAD_TTL`, also newly public) is 30 seconds; pass
   `Duration::ZERO` to disable head memoization entirely.
 - `DEFAULT_HEAD_TTL` — public `const Duration` exposing the default head
   TTL so consumers can derive values from it (e.g.
   `with_head_ttl(DEFAULT_HEAD_TTL * 4)`) instead of using magic literals.
+- `CacheStats::skip_inserts` — counter that surfaces deliberate
+  cache-insert skips (tip-touching daily windows, cold-memo daily
+  windows) in operator-facing metrics. `CacheStats::hit_rate` now
+  excludes deliberate skips from the denominator so the rate reflects
+  the cacheable-population only.
 
 ### Changed
 
@@ -28,16 +49,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that resolves N timestamp ranges on the same chain now performs 1
   genesis fetch and 1 head fetch per TTL window, eliminating the prior
   2·N redundant header fetches against a rate-limited RPC.
-- `BlockWindowCalculator::get_daily_window` now routes its chain-head
-  lookup through the same `ChainBoundsMemo` as
-  `block_range_for_timestamps`, so the head TTL configured via
+- `BlockWindowCalculator::get_daily_window` now shares the same head
+  memo as `block_range_for_timestamps`, so the head TTL configured via
   `with_head_ttl` amortizes across both methods. A long-cold-cache
   backfill issues a single `eth_blockNumber` per TTL window instead of
   one per uncached day, and mixed workloads that interleave the two
-  methods share a single head fetch. Each cold memo population now
-  also fetches the head block's timestamp (one extra
-  `eth_getBlockByNumber` per TTL window) to keep the memo shape uniform
-  across both methods.
+  methods share a single head fetch. The daily-window path only fetches
+  the head's block number (no extra `eth_getBlockByNumber`); a
+  subsequent `block_range_for_timestamps` call promotes the partial
+  entry to the full `(block, ts)` shape when it needs the timestamp.
+
+### Fixed
+
+- `get_daily_window` no longer fails on a transient `eth_getBlockByNumber`
+  error against the just-reported head (one-block reorg, free-tier
+  provider cache lag) when the requested date is fully inside chain
+  history. The daily-window path only needs the head's block number, so
+  the head's timestamp is no longer fetched eagerly on the cold-memo
+  path.
+- `get_daily_window` no longer persists windows that touch or extend
+  past the memoized chain tip. Such windows depend on future chain
+  state, and the `(chain, date)` cache key cannot disambiguate a
+  window computed against one head from one computed against a later
+  head — caching it would shadow the correct window once the chain
+  advanced into the day's range. Deliberate skips increment
+  `CacheStats::skip_inserts`. Dates strictly past the tip short-circuit
+  to the empty-window sentinel `(latest, latest)` without running the
+  binary search.
+- `get_daily_window` no longer persists windows when the head's
+  timestamp is unknown (cold memo from a daily-window-only caller).
+  Without `latest_ts` the caller cannot distinguish a fully-historical
+  day from one whose head sits inside the requested day, so the
+  conservative shape is to skip the cache insert. The best-effort
+  binary-search window is still returned; only the persistence step is
+  skipped, at the cost of one extra binary search on a subsequent cold
+  restart for the same date. Closes #14.
 
 ## [0.13.0] - 2026-05-23
 
