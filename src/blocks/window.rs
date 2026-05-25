@@ -1049,6 +1049,7 @@ where
     );
 
     if day_touches_tip {
+        cache.record_skip_insert().await;
         debug!(
             chain = %chain,
             date = %date,
@@ -2314,12 +2315,22 @@ mod tests {
                 0,
                 "memoized head must short-circuit the eth_blockNumber fetch too"
             );
+            let stats = cache.stats().await;
             assert_eq!(
-                cache.stats().await.entries,
-                0,
+                stats.entries, 0,
                 "past-tip window must not be cached — the (chain, date) key has \
                  no notion of which head was current and would shadow the correct \
                  window once the chain catches up"
+            );
+            assert_eq!(
+                stats.skip_inserts, 1,
+                "past-tip skip must increment skip_inserts so operators can \
+                 distinguish the deliberate skip from a broken insert"
+            );
+            assert_eq!(
+                stats.misses, 1,
+                "the preceding cache.get still counts as a miss — the counter \
+                 records the skip in addition to, not instead of, the miss"
             );
         }
 
@@ -2374,11 +2385,16 @@ mod tests {
                 "binary search must still probe blocks when the day starts \
                  inside chain history"
             );
+            let stats = cache.stats().await;
             assert_eq!(
-                cache.stats().await.entries,
-                0,
+                stats.entries, 0,
                 "tip-adjacent window must not be cached — more blocks may land \
                  in the day's range and the cached entry would go stale silently"
+            );
+            assert_eq!(
+                stats.skip_inserts, 1,
+                "tip-touching skip must increment skip_inserts — the binary \
+                 search ran but the result was deliberately not persisted"
             );
         }
 
@@ -2416,10 +2432,15 @@ mod tests {
             .unwrap();
 
             assert_eq!((window.start_block, window.end_block), (1, 3));
+            let stats = cache.stats().await;
             assert_eq!(
-                cache.stats().await.entries,
-                1,
+                stats.entries, 1,
                 "cold-memo historical date must still populate the cache"
+            );
+            assert_eq!(
+                stats.skip_inserts, 0,
+                "cold-memo historical date must not touch the skip counter — \
+                 the insert was successful, not skipped"
             );
         }
 
@@ -2472,11 +2493,15 @@ mod tests {
                 "binary search must still run when start_ts == latest_ts — \
                  the past-tip short-circuit fires only on strictly past dates"
             );
+            let stats = cache.stats().await;
             assert_eq!(
-                cache.stats().await.entries,
-                0,
+                stats.entries, 0,
                 "day whose start coincides with the chain tip is still partial \
                  and must not be cached"
+            );
+            assert_eq!(
+                stats.skip_inserts, 1,
+                "fence-post tip-touching skip must still increment skip_inserts"
             );
         }
     }
