@@ -79,14 +79,20 @@ impl Mergeable for GasCostResult {
 ///
 /// Stores gas cost data keyed by `(from, to, start_block, end_block)`. Cached
 /// ranges for the same address pair are kept disjoint so aggregates are never
-/// double-counted when a query overlaps prior inserts.
+/// double-counted when a query overlaps prior inserts. A cached aggregate is
+/// only used to answer a query whose window is exactly the entry's range or
+/// is exactly tiled by entries fully inside the window — a wider cached
+/// entry is never returned for a narrower query, because its total covers
+/// blocks the caller did not ask about.
 ///
 /// # Features
 ///
-/// - **Range queries**: Retrieve cached data that fully contains a requested range
+/// - **Exact-match lookup**: [`Self::get`] returns a cached value only when an
+///   entry's range exactly matches the query
 /// - **Disjoint storage**: Inserts that partially overlap existing entries are
 ///   resolved without combining their aggregates (see [`Self::insert`])
-/// - **Gap detection**: Calculate precisely which blocks are not yet cached
+/// - **Gap detection**: Calculate precisely which blocks are not yet cached,
+///   using only cached entries inside the query window
 /// - **Cache management**: Clear by address or block height
 #[derive(Debug, Clone, Default)]
 pub struct GasCache {
@@ -94,11 +100,13 @@ pub struct GasCache {
 }
 
 impl GasCache {
-    /// Retrieve cached result that fully contains the requested range
+    /// Retrieve the cached result whose range exactly matches the query
     ///
-    /// Returns a cached result if there exists an entry that completely covers
-    /// the requested block range. Checks both exact matches and larger ranges
-    /// that encompass the request.
+    /// Cached aggregates summarise the blocks they were computed over and
+    /// cannot be scoped down to a narrower window, so `get` only returns a
+    /// value when an entry's range is exactly `(start_block, end_block)`.
+    /// Use [`Self::calculate_gaps`] for gap-aware lookup that combines
+    /// disjoint entries lying inside the query window.
     ///
     /// # Arguments
     ///
@@ -109,8 +117,8 @@ impl GasCache {
     ///
     /// # Returns
     ///
-    /// - `Some(result)`: Cached data that covers `[start_block, end_block]`
-    /// - `None`: No cached entry fully contains this range
+    /// - `Some(result)`: An entry exists with this exact range
+    /// - `None`: No exact-match entry; wider or narrower entries are not returned
     ///
     /// # Example
     ///
@@ -123,13 +131,15 @@ impl GasCache {
     /// let from = Address::ZERO;
     /// let to = Address::ZERO;
     ///
-    /// // Cache blocks 100-300
     /// cache.insert(from, to, 100, 300, GasCostResult::new(NamedChain::Mainnet, from, to));
     ///
-    /// // Query for subset [150, 250] - returns cached data
-    /// assert!(cache.get(from, to, 150, 250).is_some());
+    /// // Exact match - returns cached data
+    /// assert!(cache.get(from, to, 100, 300).is_some());
     ///
-    /// // Query for [50, 350] - returns None (not fully covered)
+    /// // Subset query - returns None; use calculate_gaps for gap-aware lookup
+    /// assert!(cache.get(from, to, 150, 250).is_none());
+    ///
+    /// // Superset query - returns None
     /// assert!(cache.get(from, to, 50, 350).is_none());
     /// ```
     pub fn get(
@@ -153,8 +163,10 @@ impl GasCache {
     ///   pattern of writing back an aggregate for the full query range after
     ///   filling gaps).
     /// - **An existing entry already covers `[start_block, end_block]`** or the
-    ///   ranges only partially overlap: the new insert is dropped so existing
-    ///   aggregates are never combined with overlapping data.
+    ///   ranges only partially overlap: the new insert is dropped to preserve
+    ///   the disjoint invariant. A wider existing entry is not used to serve
+    ///   the narrower range; a follow-up query at the narrower range will
+    ///   rescan rather than read an over-counted aggregate.
     ///
     /// # Arguments
     ///
@@ -177,14 +189,18 @@ impl GasCache {
 
     /// Calculate uncached block ranges (gaps) and return merged cached data
     ///
-    /// This is the key method for incremental scanning. It analyzes which portions of
-    /// a requested block range are already cached and which need to be scanned.
+    /// This is the key method for incremental scanning. Only cached entries
+    /// whose range lies fully inside `[start_block, end_block]` contribute to
+    /// the merged result — a wider entry that extends outside the query
+    /// window is ignored, and the corresponding blocks are reported as a
+    /// gap so the caller can rescan and produce a window-scoped aggregate.
     ///
     /// # Behavior
     ///
-    /// 1. If the entire range is cached, returns `(Some(data), vec![])`
-    /// 2. If nothing is cached, returns `(None, vec![(start, end)])`
-    /// 3. If partially cached, returns merged cached data and a list of gaps
+    /// 1. If no inside-window entries exist, returns `(None, vec![(start, end)])`
+    /// 2. If inside-window entries exactly tile `[start, end]`, returns `(Some(merged), vec![])`
+    /// 3. Otherwise returns the merged value of all inside-window entries plus
+    ///    the gaps that remain inside `[start, end]`
     ///
     /// # Arguments
     ///
@@ -197,7 +213,7 @@ impl GasCache {
     /// # Returns
     ///
     /// A tuple of:
-    /// - `Option<GasCostResult>`: Merged data from all overlapping cached entries
+    /// - `Option<GasCostResult>`: Merged data from all cached entries inside the query window
     /// - `Vec<(BlockNumber, BlockNumber)>`: Sorted list of uncached ranges (gaps) to scan
     ///
     /// # Example
@@ -360,22 +376,20 @@ mod tests {
         let from = Address::ZERO;
         let to = Address::ZERO;
 
-        // Insert a range
         let result = create_test_result(NamedChain::Mainnet, from, to, 5, 100_000);
         cache.insert(from, to, 100, 200, result.clone());
 
-        // Exact match
+        // Exact match returns the cached value.
         let cached = cache.get(from, to, 100, 200);
         assert!(cached.is_some());
         assert_eq!(cached.unwrap().transaction_count, TransactionCount::new(5));
 
-        // Smaller range (fully contained)
-        let cached = cache.get(from, to, 120, 180);
-        assert!(cached.is_some());
+        // Subset query does not return the wider entry: its aggregate
+        // sums blocks outside [120, 180] and cannot be scoped down.
+        assert!(cache.get(from, to, 120, 180).is_none());
 
-        // Larger range (not fully covered)
-        let cached = cache.get(from, to, 50, 300);
-        assert!(cached.is_none());
+        // Superset query is not satisfied by the narrower entry either.
+        assert!(cache.get(from, to, 50, 300).is_none());
     }
 
     #[test]
@@ -563,9 +577,15 @@ mod tests {
         }
 
         proptest! {
-            /// Property: Gaps should never overlap with cached ranges
+            /// Property: Gaps should never overlap with cached ranges fully inside the query window
+            ///
+            /// Only fully-within cached ranges contribute to the merged result;
+            /// partial-overlap ranges are ignored and their overlap region is
+            /// reported as a gap so the caller can produce a window-scoped
+            /// aggregate by rescanning. So we only assert non-overlap against
+            /// the entries that actually contribute.
             #[test]
-            fn test_gaps_never_overlap_with_cached(
+            fn test_gaps_never_overlap_with_within_query_cached(
                 cached_ranges in cached_ranges_strategy(),
                 (query_start, query_end) in block_range_strategy()
             ) {
@@ -574,27 +594,23 @@ mod tests {
                 let to = Address::ZERO;
                 let chain = NamedChain::Mainnet;
 
-                // Insert cached ranges
                 for (start, end) in &cached_ranges {
                     cache.insert(from, to, *start, *end, create_test_result(chain, from, to, 1, 1000));
                 }
 
-                // Calculate gaps
                 let (_, gaps) = cache.calculate_gaps(chain, from, to, query_start, query_end);
 
-                // Verify no gap overlaps with any cached range
                 for (gap_start, gap_end) in &gaps {
                     for (cached_start, cached_end) in &cached_ranges {
-                        // Skip ranges outside the query window
-                        if *cached_end < query_start || *cached_start > query_end {
+                        // Only fully-within cached ranges contribute; skip the rest.
+                        if *cached_start < query_start || *cached_end > query_end {
                             continue;
                         }
 
-                        // Check for no overlap: gap ends before cached starts OR gap starts after cached ends
                         let no_overlap = *gap_end < *cached_start || *gap_start > *cached_end;
                         prop_assert!(
                             no_overlap,
-                            "Gap [{gap_start}, {gap_end}] overlaps with cached range [{cached_start}, {cached_end}]"
+                            "Gap [{gap_start}, {gap_end}] overlaps with within-query cached range [{cached_start}, {cached_end}]"
                         );
                     }
                 }
@@ -731,26 +747,51 @@ mod tests {
                 prop_assert_eq!(gaps[0], (query_start, query_end), "Gap should cover entire query range");
             }
 
-            /// Property: When query range is fully cached, should return no gaps
+            /// Property: When a cached entry exactly matches the query, return no gaps
             #[test]
-            fn test_fully_cached_returns_no_gaps(
-                (inner_start, inner_end) in block_range_strategy()
+            fn test_exact_match_returns_no_gaps(
+                (start, end) in block_range_strategy()
             ) {
                 let mut cache = GasCache::default();
                 let from = Address::ZERO;
                 let to = Address::ZERO;
                 let chain = NamedChain::Mainnet;
 
-                // Cache a range that fully covers the query (add padding)
-                let cache_start = inner_start.saturating_sub(10);
+                cache.insert(from, to, start, end, create_test_result(chain, from, to, 1, 1000));
+
+                let (result, gaps) = cache.calculate_gaps(chain, from, to, start, end);
+
+                prop_assert!(result.is_some(), "Exact-match query should return a cached result");
+                prop_assert_eq!(gaps.len(), 0, "Exact-match query should return no gaps");
+            }
+
+            /// Property: A wider cached entry never satisfies a strictly narrower query;
+            /// the whole inner window is reported as a single gap.
+            #[test]
+            fn test_wider_entry_does_not_satisfy_narrower_query(
+                (inner_start, inner_end) in block_range_strategy()
+            ) {
+                // Skip the edge case where padding would underflow or where
+                // the padded outer range equals the inner range.
+                prop_assume!(inner_start >= 10);
+
+                let mut cache = GasCache::default();
+                let from = Address::ZERO;
+                let to = Address::ZERO;
+                let chain = NamedChain::Mainnet;
+
+                let cache_start = inner_start - 10;
                 let cache_end = inner_end.saturating_add(10);
 
                 cache.insert(from, to, cache_start, cache_end, create_test_result(chain, from, to, 1, 1000));
 
                 let (result, gaps) = cache.calculate_gaps(chain, from, to, inner_start, inner_end);
 
-                prop_assert!(result.is_some(), "Fully cached range should return result");
-                prop_assert_eq!(gaps.len(), 0, "Fully cached range should return no gaps");
+                prop_assert!(
+                    result.is_none(),
+                    "wider cached entry must not contribute to a narrower query"
+                );
+                prop_assert_eq!(gaps, vec![(inner_start, inner_end)], "whole window is reported as gap");
             }
         }
     }

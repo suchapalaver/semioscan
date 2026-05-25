@@ -8,6 +8,13 @@
 //! block ranges. Cached entries for the same key are kept disjoint so aggregate
 //! values are never double-counted when ranges overlap, and gap detection reports
 //! exactly which blocks still need to be scanned.
+//!
+//! Cached aggregates summarise the blocks they were computed over and cannot be
+//! decomposed: a wider cached entry is never returned for a narrower query,
+//! since the cache does not store the per-block data needed to scope an
+//! aggregate down to a sub-window. Lookups therefore return only entries whose
+//! range is exactly the query (`get`) or lies fully inside the query window
+//! (`calculate_gaps`).
 
 use std::cmp::max;
 use std::collections::HashMap;
@@ -39,10 +46,12 @@ pub trait Mergeable {
 ///
 /// # Features
 ///
-/// - **Range queries**: Retrieve cached data that fully contains a requested range
+/// - **Exact-match lookup**: [`BlockRangeCache::get`] returns a cached value only
+///   when an entry's range exactly matches the query
 /// - **Disjoint storage**: Overlapping inserts are resolved without combining values
 ///   for the overlapping blocks (see [`BlockRangeCache::insert`])
-/// - **Gap detection**: Calculate precisely which blocks are not yet cached
+/// - **Gap detection**: Calculate precisely which blocks are not yet cached, using
+///   only cached entries that lie fully inside the query window
 #[derive(Debug, Clone, Default)]
 pub struct BlockRangeCache<K, V>
 where
@@ -57,11 +66,13 @@ where
     K: Clone + Eq + Hash,
     V: Mergeable + Clone,
 {
-    /// Retrieve cached result that fully contains the requested range
+    /// Retrieve the cached result whose range exactly matches the query
     ///
-    /// Returns a cached result if there exists an entry that completely covers
-    /// the requested block range. Checks both exact matches and larger ranges
-    /// that encompass the request.
+    /// Cached aggregates summarise the blocks they were computed over and
+    /// cannot be scoped down to a narrower window, so `get` only returns
+    /// a value when an entry's range is exactly `(start_block, end_block)`.
+    /// Use [`Self::calculate_gaps`] for gap-aware lookup that combines
+    /// disjoint entries lying inside the query window.
     ///
     /// # Arguments
     ///
@@ -71,22 +82,12 @@ where
     ///
     /// # Returns
     ///
-    /// - `Some(result)`: Cached data that covers `[start_block, end_block]`
-    /// - `None`: No cached entry fully contains this range
+    /// - `Some(result)`: An entry exists with this exact range
+    /// - `None`: No exact-match entry; a wider or narrower entry is not returned
     pub fn get(&self, key: &K, start_block: BlockNumber, end_block: BlockNumber) -> Option<V> {
-        // First check for exact match
-        if let Some(result) = self.cache.get(&(key.clone(), start_block, end_block)) {
-            return Some(result.clone());
-        }
-
-        // Check for cached results that fully cover our requested range
-        for ((cached_key, cached_start, cached_end), result) in &self.cache {
-            if cached_key == key && *cached_start <= start_block && *cached_end >= end_block {
-                return Some(result.clone());
-            }
-        }
-
-        None
+        self.cache
+            .get(&(key.clone(), start_block, end_block))
+            .cloned()
     }
 
     /// Find all cached results that overlap with the requested range
@@ -110,6 +111,26 @@ where
         overlapping
     }
 
+    /// Find cached entries whose range lies fully inside `[start_block, end_block]`
+    fn find_within_query(
+        &self,
+        key: &K,
+        start_block: BlockNumber,
+        end_block: BlockNumber,
+    ) -> Vec<((K, BlockNumber, BlockNumber), &V)> {
+        let mut within = Vec::new();
+
+        for (cache_key @ (cached_key, cached_start, cached_end), result) in &self.cache {
+            if cached_key == key && *cached_start >= start_block && *cached_end <= end_block {
+                within.push((cache_key.clone(), result));
+            }
+        }
+
+        within.sort_by_key(|((_, start, _), _)| *start);
+
+        within
+    }
+
     /// Insert a result while keeping cached ranges disjoint
     ///
     /// Aggregate values cannot be re-merged once cached without double-counting the
@@ -122,11 +143,11 @@ where
     ///   to have already aggregated any data it cared about preserving (this matches
     ///   the calculator pattern of computing gaps against the cache, scanning them,
     ///   and writing back a result for the full query range).
-    /// - **An existing entry already covers `[start_block, end_block]`**: the new
-    ///   insert is dropped because the existing entry is at least as authoritative.
-    /// - **Partial overlap with no full containment in either direction**: the new
-    ///   insert is dropped to preserve the disjoint invariant; existing data is
-    ///   never silently extended with overlapping aggregates.
+    /// - **An existing entry already covers `[start_block, end_block]`** or the
+    ///   ranges only partially overlap: the new insert is dropped to preserve
+    ///   the disjoint invariant. A wider existing entry will not be returned
+    ///   for the narrower query, so a follow-up query at the narrower range
+    ///   will rescan; the wider entry remains intact for queries that match it.
     ///
     /// # Arguments
     ///
@@ -163,11 +184,20 @@ where
     /// This is the key method for incremental scanning. It analyzes which portions of
     /// a requested block range are already cached and which need to be scanned.
     ///
+    /// Only cached entries whose range lies fully inside `[start_block,
+    /// end_block]` contribute to the merged result. An entry that extends
+    /// outside the query window — even one that fully contains it — is
+    /// ignored, because its aggregate covers blocks the caller did not ask
+    /// for and there is no per-block data to scope it down. In that case the
+    /// whole query window is reported as a gap so the caller can rescan and
+    /// produce a window-scoped aggregate.
+    ///
     /// # Behavior
     ///
-    /// 1. If the entire range is cached, returns `(Some(data), vec![])`
-    /// 2. If nothing is cached, returns `(None, vec![(start, end)])`
-    /// 3. If partially cached, returns merged cached data and a list of gaps
+    /// 1. If no inside-window entries exist, returns `(None, vec![(start, end)])`
+    /// 2. If inside-window entries exactly tile `[start, end]`, returns `(Some(merged), vec![])`
+    /// 3. Otherwise returns the merged value of all inside-window entries plus
+    ///    the gaps that remain inside `[start, end]`
     ///
     /// # Arguments
     ///
@@ -179,7 +209,7 @@ where
     /// # Returns
     ///
     /// A tuple of:
-    /// - `Option<V>`: Merged data from all overlapping cached entries
+    /// - `Option<V>`: Merged data from all cached entries inside the query window
     /// - `Vec<(u64, u64)>`: Sorted list of uncached ranges (gaps) to scan
     pub fn calculate_gaps<F>(
         &self,
@@ -191,48 +221,29 @@ where
     where
         F: FnOnce() -> V,
     {
-        // First check for exact match or fully contained range
-        if let Some(result) = self.get(key, start_block, end_block) {
-            return (Some(result), vec![]);
-        }
+        let within = self.find_within_query(key, start_block, end_block);
 
-        // Find overlapping results
-        let overlapping = self.find_overlapping(key, start_block, end_block);
-
-        if overlapping.is_empty() {
-            // No cached data, process the entire range
+        if within.is_empty() {
             return (None, vec![(start_block, end_block)]);
         }
 
-        // Merge the overlapping results
+        // Merge the inside-window results
         let mut merged_result = create_empty();
-        for (_, result) in &overlapping {
+        for (_, result) in &within {
             merged_result.merge(result);
         }
 
-        // Identify gaps by tracking covered ranges
-        let mut covered_ranges: Vec<(BlockNumber, BlockNumber)> = overlapping
-            .iter()
-            .map(|((_, block_start, block_end), _)| (*block_start, *block_end))
-            .collect();
-
-        // Sort by start block
-        covered_ranges.sort_by_key(|(start, _)| *start);
-
-        // Find gaps
+        // Identify gaps by walking the inside-window ranges in start order
         let mut gaps = vec![];
         let mut current = start_block;
 
-        for (range_start, range_end) in covered_ranges {
-            if current < range_start {
-                // Found a gap
-                gaps.push((current, range_start - 1));
+        for ((_, range_start, range_end), _) in &within {
+            if current < *range_start {
+                gaps.push((current, *range_start - 1));
             }
-            // Move pointer past this range
-            current = max(current, range_end + 1);
+            current = max(current, *range_end + 1);
         }
 
-        // Check if there's a gap after the last range
         if current <= end_block {
             gaps.push((current, end_block));
         }
@@ -307,18 +318,21 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_fully_contained_range() {
+    fn test_get_does_not_return_wider_entry_for_narrower_query() {
+        // A wider cached entry's aggregate sums blocks outside the query window
+        // and cannot be scoped down without per-block data the cache never
+        // stored. `get` is exact-match-only so callers cannot accidentally
+        // consume an over-counted aggregate.
         let mut cache = BlockRangeCache::default();
         let key = "test".to_string();
-        let value = TestValue::new(5, 1000);
 
-        // Cache blocks 50-250
-        cache.insert(key.clone(), 50, 250, value.clone());
+        cache.insert(key.clone(), 50, 250, TestValue::new(5, 1000));
 
-        // Request blocks 100-200 (fully contained)
         let result = cache.get(&key, 100, 200);
-        assert!(result.is_some(), "Should find contained range");
-        assert_eq!(result.unwrap(), value);
+        assert!(
+            result.is_none(),
+            "wider cached entry must not serve narrower query"
+        );
     }
 
     #[test]
@@ -433,34 +447,37 @@ mod tests {
     }
 
     #[test]
-    fn test_calculate_gaps_fully_cached() {
+    fn test_calculate_gaps_exact_match_fully_cached() {
+        // An exact-match cached entry serves the query directly with no gaps.
         let mut cache = BlockRangeCache::default();
         let key = "test".to_string();
 
-        cache.insert(key.clone(), 50, 250, TestValue::new(10, 1000));
+        cache.insert(key.clone(), 100, 200, TestValue::new(10, 1000));
 
         let (result, gaps) = cache.calculate_gaps(&key, 100, 200, || TestValue::new(0, 0));
 
-        assert!(result.is_some(), "Should return cached result");
-        assert_eq!(gaps.len(), 0, "No gaps when fully cached");
+        assert_eq!(result.unwrap(), TestValue::new(10, 1000));
+        assert!(gaps.is_empty(), "No gaps when query matches a cached entry");
     }
 
     #[test]
-    fn test_calculate_gaps_nested_existing_range() {
-        // A cached entry wider than the query window short-circuits the
-        // fully-contained branch of `get`, so `calculate_gaps` returns the
-        // entry's aggregate verbatim with no gaps. Scoping that aggregate
-        // down to the narrower window would require per-block data the
-        // cache does not store, so the value reflects the wider range it
-        // was cached under.
+    fn test_calculate_gaps_wider_entry_reports_whole_query_as_gap() {
+        // A wider cached entry's aggregate covers blocks outside the query
+        // window, so it cannot be used to answer the narrower query. The
+        // whole window is reported as a gap so the caller rescans and
+        // produces a window-scoped aggregate instead of consuming the wider
+        // entry's over-counted total.
         let mut cache = BlockRangeCache::default();
         let key = "test".to_string();
 
         cache.insert(key.clone(), 50, 350, TestValue::new(10, 1000));
 
         let (result, gaps) = cache.calculate_gaps(&key, 100, 300, || TestValue::new(0, 0));
-        assert!(gaps.is_empty(), "wider cached entry covers the whole query");
-        assert_eq!(result.unwrap(), TestValue::new(10, 1000));
+        assert!(
+            result.is_none(),
+            "wider cached entry must not contribute to narrower query"
+        );
+        assert_eq!(gaps, vec![(100, 300)], "whole query window is uncached");
     }
 
     #[test]

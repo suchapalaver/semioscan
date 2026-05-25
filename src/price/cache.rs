@@ -63,18 +63,24 @@ impl Mergeable for TokenPriceResult {
 ///
 /// Stores price data keyed by `(token_address, start_block, end_block)`. Cached
 /// ranges for the same token are kept disjoint so aggregate token and USDC
-/// amounts are never double-counted when ranges overlap.
+/// amounts are never double-counted when ranges overlap. A cached aggregate is
+/// only used to answer a query whose window is exactly the entry's range or is
+/// exactly tiled by entries fully inside the window — a wider cached entry is
+/// never returned for a narrower query, because its totals cover blocks the
+/// caller did not ask about.
 #[derive(Debug, Clone, Default)]
 pub struct PriceCache {
     inner: BlockRangeCache<Address, TokenPriceResult>,
 }
 
 impl PriceCache {
-    /// Retrieve cached result that fully contains the requested range
+    /// Retrieve the cached result whose range exactly matches the query
     ///
-    /// Returns a cached result if there exists an entry that completely covers
-    /// the requested block range. Checks both exact matches and larger ranges
-    /// that encompass the request.
+    /// Cached aggregates summarise the blocks they were computed over and
+    /// cannot be scoped down to a narrower window, so `get` only returns a
+    /// value when an entry's range is exactly `(start_block, end_block)`.
+    /// Use [`Self::calculate_gaps`] for gap-aware lookup that combines
+    /// disjoint entries lying inside the query window.
     pub fn get(
         &self,
         token_address: Address,
@@ -95,8 +101,10 @@ impl PriceCache {
     ///   pattern of writing back an aggregate for the full query range after
     ///   filling gaps).
     /// - **An existing entry already covers `[start_block, end_block]`** or the
-    ///   ranges only partially overlap: the new insert is dropped so existing
-    ///   aggregates are never combined with overlapping data.
+    ///   ranges only partially overlap: the new insert is dropped to preserve
+    ///   the disjoint invariant. A wider existing entry is not used to serve
+    ///   the narrower range; a follow-up query at the narrower range will
+    ///   rescan rather than read an over-counted aggregate.
     pub fn insert(
         &mut self,
         token_address: Address,
@@ -110,8 +118,14 @@ impl PriceCache {
 
     /// Calculate which block ranges need to be processed by finding gaps in the cached data
     ///
+    /// Only cached entries whose range lies fully inside `[start_block,
+    /// end_block]` contribute to the merged result — a wider entry that
+    /// extends outside the query window is ignored, and the corresponding
+    /// blocks are reported as a gap so the caller can rescan and produce a
+    /// window-scoped aggregate.
+    ///
     /// Returns a tuple of:
-    /// - `Option<TokenPriceResult>`: Merged data from all overlapping cached entries
+    /// - `Option<TokenPriceResult>`: Merged data from all cached entries inside the query window
     /// - `Vec<BlockRange>`: Sorted list of uncached ranges (gaps) to scan
     pub fn calculate_gaps(
         &self,
@@ -183,25 +197,18 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_fully_contained_range() {
+    fn test_get_does_not_return_wider_entry_for_narrower_query() {
+        // A wider cached entry's aggregate sums blocks outside the query
+        // window. `get` is exact-match-only so callers cannot accidentally
+        // consume an over-counted aggregate.
         let mut cache = PriceCache::default();
         let token = address!("0000000000000000000000000000000000000001");
-        let expected = create_price_result(token, 1000.0, 500.0);
+        cache.insert(token, 50, 250, create_price_result(token, 1000.0, 500.0));
 
-        // Cache blocks 50-250
-        cache.insert(token, 50, 250, expected.clone());
-
-        // Request blocks 100-200 (fully contained)
         let result = cache.get(token, 100, 200);
-        assert!(result.is_some(), "Should find contained range");
-        let retrieved = result.unwrap();
-        assert_eq!(
-            retrieved.total_token_amount.as_f64(),
-            expected.total_token_amount.as_f64()
-        );
-        assert_eq!(
-            retrieved.total_usdc_amount.as_f64(),
-            expected.total_usdc_amount.as_f64()
+        assert!(
+            result.is_none(),
+            "wider cached entry must not serve narrower query"
         );
     }
 
@@ -248,17 +255,17 @@ mod tests {
     }
 
     #[test]
-    fn test_calculate_gaps_fully_cached() {
+    fn test_calculate_gaps_exact_match_fully_cached() {
+        // An exact-match cached entry serves the query directly with no gaps.
         let mut cache = PriceCache::default();
         let token = address!("0000000000000000000000000000000000000001");
         let expected = create_price_result(token, 1000.0, 500.0);
 
-        cache.insert(token, 50, 250, expected.clone());
+        cache.insert(token, 100, 200, expected.clone());
 
         let (result, gaps) = cache.calculate_gaps(token, 100, 200);
 
-        assert!(result.is_some(), "Should return cached result");
-        let retrieved = result.unwrap();
+        let retrieved = result.expect("exact-match query returns cached result");
         assert_eq!(
             retrieved.total_token_amount.as_f64(),
             expected.total_token_amount.as_f64()
@@ -267,7 +274,26 @@ mod tests {
             retrieved.total_usdc_amount.as_f64(),
             expected.total_usdc_amount.as_f64()
         );
-        assert_eq!(gaps.len(), 0, "No gaps when fully cached");
+        assert!(gaps.is_empty(), "No gaps when query matches a cached entry");
+    }
+
+    #[test]
+    fn test_calculate_gaps_wider_entry_reports_whole_query_as_gap() {
+        // A wider cached entry's aggregate covers blocks outside the query
+        // window, so it cannot be used to answer the narrower query. The
+        // whole window is reported as a gap so the caller rescans and
+        // produces a window-scoped aggregate.
+        let mut cache = PriceCache::default();
+        let token = address!("0000000000000000000000000000000000000001");
+
+        cache.insert(token, 50, 350, create_price_result(token, 1000.0, 500.0));
+
+        let (result, gaps) = cache.calculate_gaps(token, 100, 300);
+        assert!(
+            result.is_none(),
+            "wider cached entry must not contribute to narrower query"
+        );
+        assert_eq!(gaps, vec![BlockRange::new(100, 300)]);
     }
 
     #[test]
@@ -593,36 +619,37 @@ mod tests {
         }
 
         proptest! {
-            /// Property: Gaps should never overlap with cached ranges
+            /// Property: Gaps should never overlap with cached ranges fully inside the query window
+            ///
+            /// Only fully-within cached ranges contribute to the merged result;
+            /// partial-overlap ranges are ignored and their overlap region is
+            /// reported as a gap so the caller can produce a window-scoped
+            /// aggregate by rescanning.
             #[test]
-            fn test_gaps_never_overlap_with_cached(
+            fn test_gaps_never_overlap_with_within_query_cached(
                 cached_ranges in cached_ranges_strategy(),
                 (query_start, query_end) in block_range_strategy()
             ) {
                 let mut cache = PriceCache::default();
                 let token = address!("0000000000000000000000000000000000000001");
 
-                // Insert cached ranges
                 for (start, end) in &cached_ranges {
                     cache.insert(token, *start, *end, create_price_result(token, 1000.0, 500.0));
                 }
 
-                // Calculate gaps
                 let (_, gaps) = cache.calculate_gaps(token, query_start, query_end);
 
-                // Verify no gap overlaps with any cached range
                 for gap in &gaps {
                     for (cached_start, cached_end) in &cached_ranges {
-                        // Skip ranges outside the query window
-                        if *cached_end < query_start || *cached_start > query_end {
+                        // Only fully-within cached ranges contribute; skip the rest.
+                        if *cached_start < query_start || *cached_end > query_end {
                             continue;
                         }
 
-                        // Check for no overlap: gap ends before cached starts OR gap starts after cached ends
                         let no_overlap = gap.end < *cached_start || gap.start > *cached_end;
                         prop_assert!(
                             no_overlap,
-                            "Gap [{}, {}] overlaps with cached range [{cached_start}, {cached_end}]",
+                            "Gap [{}, {}] overlaps with within-query cached range [{cached_start}, {cached_end}]",
                             gap.start, gap.end
                         );
                     }
@@ -753,24 +780,45 @@ mod tests {
                 prop_assert_eq!(gaps[0], BlockRange::new(query_start, query_end), "Gap should cover entire query range");
             }
 
-            /// Property: When query range is fully cached, should return no gaps
+            /// Property: When a cached entry exactly matches the query, return no gaps
             #[test]
-            fn test_fully_cached_returns_no_gaps(
-                (inner_start, inner_end) in block_range_strategy()
+            fn test_exact_match_returns_no_gaps(
+                (start, end) in block_range_strategy()
             ) {
                 let mut cache = PriceCache::default();
                 let token = address!("0000000000000000000000000000000000000001");
 
-                // Cache a range that fully covers the query (add padding)
-                let cache_start = inner_start.saturating_sub(10);
+                cache.insert(token, start, end, create_price_result(token, 1000.0, 500.0));
+
+                let (result, gaps) = cache.calculate_gaps(token, start, end);
+
+                prop_assert!(result.is_some(), "Exact-match query should return a cached result");
+                prop_assert_eq!(gaps.len(), 0, "Exact-match query should return no gaps");
+            }
+
+            /// Property: A wider cached entry never satisfies a strictly narrower query;
+            /// the whole inner window is reported as a single gap.
+            #[test]
+            fn test_wider_entry_does_not_satisfy_narrower_query(
+                (inner_start, inner_end) in block_range_strategy()
+            ) {
+                prop_assume!(inner_start >= 10);
+
+                let mut cache = PriceCache::default();
+                let token = address!("0000000000000000000000000000000000000001");
+
+                let cache_start = inner_start - 10;
                 let cache_end = inner_end.saturating_add(10);
 
                 cache.insert(token, cache_start, cache_end, create_price_result(token, 1000.0, 500.0));
 
                 let (result, gaps) = cache.calculate_gaps(token, inner_start, inner_end);
 
-                prop_assert!(result.is_some(), "Fully cached range should return result");
-                prop_assert_eq!(gaps.len(), 0, "Fully cached range should return no gaps");
+                prop_assert!(
+                    result.is_none(),
+                    "wider cached entry must not contribute to a narrower query"
+                );
+                prop_assert_eq!(gaps, vec![BlockRange::new(inner_start, inner_end)]);
             }
         }
     }
