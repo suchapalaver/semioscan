@@ -4,6 +4,8 @@
 
 //! Provider factory functions for creating type-erased providers
 
+use std::time::Duration;
+
 use alloy_network::AnyNetwork;
 use alloy_provider::RootProvider;
 use alloy_rpc_client::{ClientBuilder, RpcClient};
@@ -14,6 +16,36 @@ use crate::transport::RateLimitLayer;
 use super::config::ProviderConfig;
 use super::http_client::reqwest_client_with_timeout;
 use super::AnyHttpProvider;
+
+/// Resolve the `(rate_limit_per_second, min_delay)` pair into the single
+/// rate-limit layer the transport should install, or `None` for unpaced.
+///
+/// Centralising the dispatch here keeps the HTTP and WS factories from
+/// drifting on which axis wins when both are set, and makes the
+/// construction-time `tracing::warn!` for the over-specified case fire
+/// from one place regardless of transport. Adding a new rate-limit axis
+/// is a single edit to this helper rather than a parallel change in
+/// every factory.
+///
+/// Precedence: when both axes are set, `rate_limit_per_second` wins and
+/// `min_delay` is dropped with a warn. This matches the documented
+/// `ProviderPoolBuilder` precedence and the historical HTTP behaviour.
+pub(super) fn rate_limit_layer_for(
+    rate_limit_per_second: Option<u32>,
+    min_delay: Option<Duration>,
+) -> Option<RateLimitLayer> {
+    match (rate_limit_per_second, min_delay) {
+        (Some(rps), Some(_)) => {
+            tracing::warn!(
+                "Both rate_limit_per_second and min_delay specified, using rate_limit_per_second"
+            );
+            Some(RateLimitLayer::per_second(rps))
+        }
+        (Some(rps), None) => Some(RateLimitLayer::per_second(rps)),
+        (None, Some(delay)) => Some(RateLimitLayer::with_min_delay(delay)),
+        (None, None) => None,
+    }
+}
 
 /// Build the configured `RpcClient` shared by every HTTP factory.
 ///
@@ -30,49 +62,17 @@ pub(super) fn build_http_client(config: ProviderConfig) -> Result<RpcClient, Rpc
         .map_err(|e| RpcError::ProviderUrlInvalid(format!("{e}")))?;
 
     let builder = ClientBuilder::default();
+    let layer = rate_limit_layer_for(config.rate_limit_per_second, config.min_delay);
 
-    let client = match (config.rate_limit_per_second, config.min_delay) {
-        // Both rate limit and min delay (prefer rate limit)
-        (Some(rps), Some(_)) => {
-            tracing::warn!(
-                "Both rate_limit_per_second and min_delay specified, using rate_limit_per_second"
-            );
-            let builder = builder.layer(RateLimitLayer::per_second(rps));
-            match config.timeout {
-                Some(timeout) => {
-                    builder.http_with_client(reqwest_client_with_timeout(timeout)?, url)
-                }
-                None => builder.http(url),
-            }
+    let client = match (layer, config.timeout) {
+        (Some(layer), Some(timeout)) => builder
+            .layer(layer)
+            .http_with_client(reqwest_client_with_timeout(timeout)?, url),
+        (Some(layer), None) => builder.layer(layer).http(url),
+        (None, Some(timeout)) => {
+            builder.http_with_client(reqwest_client_with_timeout(timeout)?, url)
         }
-
-        // Rate limit only
-        (Some(rps), None) => {
-            let builder = builder.layer(RateLimitLayer::per_second(rps));
-            match config.timeout {
-                Some(timeout) => {
-                    builder.http_with_client(reqwest_client_with_timeout(timeout)?, url)
-                }
-                None => builder.http(url),
-            }
-        }
-
-        // Min delay only
-        (None, Some(delay)) => {
-            let builder = builder.layer(RateLimitLayer::with_min_delay(delay));
-            match config.timeout {
-                Some(timeout) => {
-                    builder.http_with_client(reqwest_client_with_timeout(timeout)?, url)
-                }
-                None => builder.http(url),
-            }
-        }
-
-        // No rate-limiting layer
-        (None, None) => match config.timeout {
-            Some(timeout) => builder.http_with_client(reqwest_client_with_timeout(timeout)?, url),
-            None => builder.http(url),
-        },
+        (None, None) => builder.http(url),
     };
 
     Ok(client)
@@ -127,6 +127,28 @@ pub fn create_http_provider(config: ProviderConfig) -> Result<AnyHttpProvider, R
 /// pending transactions. They're ideal for applications that need low-latency
 /// event monitoring.
 ///
+/// # Configuration Options
+///
+/// Honors the rate-limit axes on [`ProviderConfig`] using the same matrix
+/// as the HTTP factories:
+///
+/// - `rate_limit_per_second` — installs a token-bucket layer that throttles
+///   requests to the configured rate.
+/// - `min_delay` — installs a minimum-delay layer that guarantees at least
+///   the configured gap between consecutive requests; useful for strict
+///   upstreams that prefer pacing over bursts.
+///
+/// If both `rate_limit_per_second` and `min_delay` are set, the rate-limit
+/// axis wins and a `tracing::warn!` is emitted so the operator can spot the
+/// conflicting configuration. This precedence matches every other transport
+/// in the crate.
+///
+/// `config.timeout` is **not honored** for WebSocket providers: the
+/// underlying `alloy_provider::WsConnect` does not expose a per-request
+/// timeout knob, so a `timeout` set on the config is dropped at construction
+/// with a `tracing::warn!`. If you need a request-level timeout on a WS
+/// connection, wrap the calls at the application layer.
+///
 /// # Note
 ///
 /// This function is async because WebSocket connections require a handshake.
@@ -135,9 +157,11 @@ pub fn create_http_provider(config: ProviderConfig) -> Result<AnyHttpProvider, R
 ///
 /// ```rust,ignore
 /// use semioscan::provider::{create_ws_provider, ProviderConfig};
+/// use std::time::Duration;
 ///
 /// let provider = create_ws_provider(
 ///     ProviderConfig::new("wss://eth.llamarpc.com/ws")
+///         .with_min_delay(Duration::from_millis(250))
 /// ).await?;
 ///
 /// // Subscribe to new blocks
@@ -158,16 +182,25 @@ pub async fn create_ws_provider(
 ) -> Result<alloy_provider::RootProvider<AnyNetwork>, RpcError> {
     use alloy_provider::WsConnect;
 
+    if config.timeout.is_some() {
+        tracing::warn!(
+            "ProviderConfig::timeout is ignored for WebSocket providers; \
+             alloy_provider::WsConnect does not expose a per-request timeout knob"
+        );
+    }
+
     let ws = WsConnect::new(&config.url);
 
-    let client = match config.rate_limit_per_second {
-        Some(rps) => ClientBuilder::default()
-            .layer(RateLimitLayer::per_second(rps))
+    let builder = ClientBuilder::default();
+    let layer = rate_limit_layer_for(config.rate_limit_per_second, config.min_delay);
+
+    let client = match layer {
+        Some(layer) => builder
+            .layer(layer)
             .ws(ws)
             .await
             .map_err(|e| RpcError::ProviderConnectionFailed(e.to_string()))?,
-
-        None => ClientBuilder::default()
+        None => builder
             .ws(ws)
             .await
             .map_err(|e| RpcError::ProviderConnectionFailed(e.to_string()))?,
@@ -345,5 +378,81 @@ mod tests {
                 .with_min_delay(Duration::from_millis(250)),
         )
         .expect("both axes");
+    }
+
+    /// `rate_limit_layer_for` is the single point of `(rate_limit_per_second,
+    /// min_delay)` dispatch shared by the HTTP and WS factories. Drift on
+    /// which axis wins, or on whether a layer is installed at all, would
+    /// silently change the wire behaviour of every provider this crate
+    /// builds — this test pins the matrix shape so a regression has to
+    /// touch one assertion per arm to land.
+    #[test]
+    fn rate_limit_layer_for_covers_full_matrix() {
+        use std::time::Duration;
+
+        assert!(
+            rate_limit_layer_for(None, None).is_none(),
+            "both axes unset must produce no layer"
+        );
+        assert!(
+            rate_limit_layer_for(Some(10), None).is_some(),
+            "rate_limit_per_second alone must install a layer"
+        );
+        assert!(
+            rate_limit_layer_for(None, Some(Duration::from_millis(250))).is_some(),
+            "min_delay alone must install a layer"
+        );
+        assert!(
+            rate_limit_layer_for(Some(5), Some(Duration::from_millis(250))).is_some(),
+            "both axes set must install a layer (rate-limit wins; min_delay dropped)"
+        );
+    }
+
+    /// Surface check that `create_ws_provider` compiles and runs through
+    /// every `(rate_limit_per_second, min_delay)` combination without
+    /// shape-level regressions (e.g. an arm reintroducing a one-axis
+    /// match and dropping a layer at the type level).
+    ///
+    /// This does **not** prove the matching rate-limit layer is installed
+    /// — the WS factory's `None` arm in the pre-fix shape also returns an
+    /// error against this URL while silently dropping `min_delay`. The
+    /// behavioural contract for the matrix lives in
+    /// `rate_limit_layer_for_covers_full_matrix` above (which the WS
+    /// factory routes through) and in the HTTP `typed_provider_min_delay`
+    /// integration test (which exercises the same helper end-to-end on a
+    /// real transport).
+    #[cfg(feature = "ws")]
+    #[tokio::test]
+    async fn create_ws_provider_accepts_full_dispatch_matrix() {
+        use std::time::Duration;
+
+        let url = "not-a-valid-ws-url";
+
+        assert!(
+            create_ws_provider(ProviderConfig::new(url)).await.is_err(),
+            "no rate limiting"
+        );
+        assert!(
+            create_ws_provider(ProviderConfig::new(url).with_rate_limit(10))
+                .await
+                .is_err(),
+            "rate_limit_per_second"
+        );
+        assert!(
+            create_ws_provider(ProviderConfig::new(url).with_min_delay(Duration::from_millis(250)))
+                .await
+                .is_err(),
+            "min_delay only"
+        );
+        assert!(
+            create_ws_provider(
+                ProviderConfig::new(url)
+                    .with_rate_limit(5)
+                    .with_min_delay(Duration::from_millis(250)),
+            )
+            .await
+            .is_err(),
+            "both axes"
+        );
     }
 }
