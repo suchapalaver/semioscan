@@ -5,18 +5,20 @@
 //! Generic block-range cache with gap detection
 //!
 //! This module provides a generic caching mechanism for any data that is keyed by
-//! block ranges. It supports automatic merging of overlapping ranges and gap detection
-//! to identify uncached regions.
+//! block ranges. Cached entries for the same key are kept disjoint so aggregate
+//! values are never double-counted when ranges overlap, and gap detection reports
+//! exactly which blocks still need to be scanned.
 
-use std::cmp::{max, min};
+use std::cmp::max;
 use std::collections::HashMap;
 use std::hash::Hash;
 
 use alloy_primitives::BlockNumber;
 
-/// Trait for values that can be merged when overlapping cache entries are combined
+/// Trait for values that can be combined when adjacent or disjoint cached
+/// segments are aggregated for a query
 pub trait Mergeable {
-    /// Merge another value into self
+    /// Combine another value into self
     fn merge(&mut self, other: &Self);
 }
 
@@ -30,10 +32,16 @@ pub trait Mergeable {
 /// * `K` - The domain key type (must be `Clone + Eq + Hash`)
 /// * `V` - The cached value type (must implement `Mergeable` and `Clone`)
 ///
+/// # Invariants
+///
+/// For a given key, cached block ranges never overlap. `insert` enforces this so
+/// aggregate values stored in the cache are never silently double-counted.
+///
 /// # Features
 ///
 /// - **Range queries**: Retrieve cached data that fully contains a requested range
-/// - **Auto-merging**: Overlapping inserts are automatically merged
+/// - **Disjoint storage**: Overlapping inserts are resolved without combining values
+///   for the overlapping blocks (see [`BlockRangeCache::insert`])
 /// - **Gap detection**: Calculate precisely which blocks are not yet cached
 #[derive(Debug, Clone, Default)]
 pub struct BlockRangeCache<K, V>
@@ -102,13 +110,23 @@ where
         overlapping
     }
 
-    /// Insert a result and automatically merge with overlapping entries
+    /// Insert a result while keeping cached ranges disjoint
     ///
-    /// When inserting a result that overlaps with existing cached data, this method:
-    /// 1. Finds all overlapping entries
-    /// 2. Merges their values using the `Mergeable` trait
-    /// 3. Extends the block range to cover all overlapping entries
-    /// 4. Removes the old entries and stores the merged result
+    /// Aggregate values cannot be re-merged once cached without double-counting the
+    /// blocks they share, so `insert` resolves overlap by choosing whose range is
+    /// authoritative rather than combining values:
+    ///
+    /// - **No overlap with existing entries**: stored as a new disjoint segment.
+    /// - **`[start_block, end_block]` covers every overlapping entry**: those
+    ///   entries are removed and replaced with the new value. The caller is expected
+    ///   to have already aggregated any data it cared about preserving (this matches
+    ///   the calculator pattern of computing gaps against the cache, scanning them,
+    ///   and writing back a result for the full query range).
+    /// - **An existing entry already covers `[start_block, end_block]`**: the new
+    ///   insert is dropped because the existing entry is at least as authoritative.
+    /// - **Partial overlap with no full containment in either direction**: the new
+    ///   insert is dropped to preserve the disjoint invariant; existing data is
+    ///   never silently extended with overlapping aggregates.
     ///
     /// # Arguments
     ///
@@ -117,39 +135,27 @@ where
     /// * `end_block` - End of block range (inclusive)
     /// * `value` - Data for this range
     pub fn insert(&mut self, key: K, start_block: BlockNumber, end_block: BlockNumber, value: V) {
-        // Find overlapping results
         let overlapping = self.find_overlapping(&key, start_block, end_block);
 
         if overlapping.is_empty() {
-            // No overlap, simple insert
             self.cache.insert((key, start_block, end_block), value);
-            return;
+        } else if overlapping
+            .iter()
+            .all(|((_, cached_start, cached_end), _)| {
+                *cached_start >= start_block && *cached_end <= end_block
+            })
+        {
+            let keys_to_remove: Vec<(K, BlockNumber, BlockNumber)> =
+                overlapping.iter().map(|(k, _)| k.clone()).collect();
+            for cache_key in keys_to_remove {
+                self.cache.remove(&cache_key);
+            }
+            self.cache.insert((key, start_block, end_block), value);
         }
-
-        // There's overlap - we need to merge results
-        let mut merged_value = value;
-        let mut min_start = start_block;
-        let mut max_end = end_block;
-
-        // Collect keys to remove after merging
-        let keys_to_remove: Vec<(K, BlockNumber, BlockNumber)> =
-            overlapping.iter().map(|(k, _)| k.clone()).collect();
-
-        // Merge all overlapping results
-        for ((_, cached_start, cached_end), cached_value) in overlapping {
-            min_start = min(min_start, cached_start);
-            max_end = max(max_end, cached_end);
-
-            merged_value.merge(cached_value);
-        }
-
-        // Remove old entries
-        for cache_key in keys_to_remove {
-            self.cache.remove(&cache_key);
-        }
-
-        // Insert the merged result
-        self.cache.insert((key, min_start, max_end), merged_value);
+        // Else: an existing entry already covers the new range, or the new
+        // range partially overlaps a wider entry without fully containing it.
+        // Keep existing entries untouched so we never double-count overlapping
+        // blocks.
     }
 
     /// Calculate uncached block ranges (gaps) and return merged cached data
@@ -332,23 +338,86 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_with_overlap_merges() {
+    fn test_insert_partial_overlap_does_not_double_count() {
+        // Inserting two ranges that partially overlap must never produce a single
+        // cached entry whose aggregate counts the overlapping blocks twice. The
+        // first insert wins; the second is dropped so existing aggregates are
+        // preserved untouched.
         let mut cache = BlockRangeCache::default();
         let key = "test".to_string();
 
-        // Insert first range: 100-200
         cache.insert(key.clone(), 100, 200, TestValue::new(5, 500));
-
-        // Insert overlapping range: 150-250
         cache.insert(key.clone(), 150, 250, TestValue::new(3, 800));
 
-        // Should be merged into single range: 100-250
-        let result = cache.get(&key, 100, 250);
-        assert!(result.is_some(), "Should find merged range");
+        assert_eq!(
+            cache.len(),
+            1,
+            "partial-overlap insert must not be combined"
+        );
+        let kept = cache.get(&key, 100, 200).expect("original range preserved");
+        assert_eq!(kept, TestValue::new(5, 500));
+        assert!(
+            cache.get(&key, 100, 250).is_none(),
+            "no cached entry should claim to cover the union of the two ranges"
+        );
+    }
 
-        let merged = result.unwrap();
-        assert_eq!(merged.count, 8); // 5 + 3
-        assert_eq!(merged.total, 1300); // 500 + 800
+    #[test]
+    fn test_insert_new_range_covering_existing_replaces() {
+        // When a calculator finishes scanning gaps and writes back an aggregate
+        // for the full query range, the new value already contains everything
+        // from the prior gap inserts. The cache must replace those prior
+        // entries with the new authoritative value instead of merging.
+        let mut cache = BlockRangeCache::default();
+        let key = "test".to_string();
+
+        cache.insert(key.clone(), 100, 150, TestValue::new(2, 200));
+        cache.insert(key.clone(), 200, 250, TestValue::new(3, 300));
+
+        // Caller-aggregated total for the full range, including the two prior
+        // segments and the (151..=199) gap they cover after rescanning.
+        cache.insert(key.clone(), 100, 250, TestValue::new(7, 900));
+
+        assert_eq!(cache.len(), 1, "covering insert collapses prior segments");
+        let stored = cache.get(&key, 100, 250).expect("covering range cached");
+        assert_eq!(
+            stored,
+            TestValue::new(7, 900),
+            "caller-supplied value is authoritative, not added to prior aggregates"
+        );
+    }
+
+    #[test]
+    fn test_insert_nested_in_existing_is_skipped() {
+        // The existing wider entry already aggregates these blocks; storing a
+        // narrower entry would either be redundant or risk breaking the
+        // disjoint invariant on later inserts.
+        let mut cache = BlockRangeCache::default();
+        let key = "test".to_string();
+
+        cache.insert(key.clone(), 100, 300, TestValue::new(10, 1000));
+        cache.insert(key.clone(), 150, 250, TestValue::new(99, 9999));
+
+        assert_eq!(cache.len(), 1);
+        let stored = cache.get(&key, 100, 300).unwrap();
+        assert_eq!(stored, TestValue::new(10, 1000));
+    }
+
+    #[test]
+    fn test_insert_adjacent_ranges_stay_disjoint() {
+        // Adjacent (but not overlapping) ranges are kept as distinct segments;
+        // calculate_gaps merges them on demand without double-counting.
+        let mut cache = BlockRangeCache::default();
+        let key = "test".to_string();
+
+        cache.insert(key.clone(), 100, 200, TestValue::new(2, 200));
+        cache.insert(key.clone(), 201, 300, TestValue::new(3, 300));
+
+        assert_eq!(cache.len(), 2);
+        let (result, gaps) = cache.calculate_gaps(&key, 100, 300, || TestValue::new(0, 0));
+        assert!(gaps.is_empty(), "adjacent ranges leave no gap");
+        let merged = result.expect("merged result available");
+        assert_eq!(merged, TestValue::new(5, 500));
     }
 
     #[test]
@@ -374,6 +443,24 @@ mod tests {
 
         assert!(result.is_some(), "Should return cached result");
         assert_eq!(gaps.len(), 0, "No gaps when fully cached");
+    }
+
+    #[test]
+    fn test_calculate_gaps_nested_existing_range() {
+        // A cached entry wider than the query window short-circuits the
+        // fully-contained branch of `get`, so `calculate_gaps` returns the
+        // entry's aggregate verbatim with no gaps. Scoping that aggregate
+        // down to the narrower window would require per-block data the
+        // cache does not store, so the value reflects the wider range it
+        // was cached under.
+        let mut cache = BlockRangeCache::default();
+        let key = "test".to_string();
+
+        cache.insert(key.clone(), 50, 350, TestValue::new(10, 1000));
+
+        let (result, gaps) = cache.calculate_gaps(&key, 100, 300, || TestValue::new(0, 0));
+        assert!(gaps.is_empty(), "wider cached entry covers the whole query");
+        assert_eq!(result.unwrap(), TestValue::new(10, 1000));
     }
 
     #[test]
