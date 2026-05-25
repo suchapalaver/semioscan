@@ -129,11 +129,18 @@ pub async fn fetch_logs_chunked<P: Provider>(
     let scanner = LogScanner::new(provider, SemioscanConfig::minimal());
 
     scanner
-        .scan_raw(chunk_size, None, filter, start_block, end_block, |e| {
-            Some(EventProcessingError::rpc_failed(format!(
-                "Failed to fetch logs: {e}"
-            )))
-        })
+        .scan_raw(
+            chunk_size,
+            None,
+            filter,
+            start_block,
+            end_block,
+            |chunk_from, chunk_to, e| {
+                Some(EventProcessingError::rpc_failed(format!(
+                    "Failed to fetch logs for blocks {chunk_from}-{chunk_to}: {e}"
+                )))
+            },
+        )
         .await
 }
 
@@ -397,6 +404,31 @@ mod tests {
             transport.calls(),
             2,
             "third chunk must not be attempted after the second fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn chunk_error_message_identifies_the_failing_block_window() {
+        // Operators rely on the chunked-fetch error string to pinpoint which
+        // chunk of a multi-chunk scan failed. With three 100-block chunks
+        // (0-99, 100-199, 200-299) and only the middle chunk failing, the
+        // error must name 100-199 rather than the outer 0-299 range or any
+        // other ambiguous shape.
+        let transport = ScriptedTransport::default();
+        transport.push_success("eth_getLogs", &vec![dummy_log()]);
+        transport.push_failure("eth_getLogs", "boom on chunk two");
+        transport.push_success("eth_getLogs", &Vec::<RpcLog>::new());
+
+        let provider = build_provider(transport);
+        let filter = Filter::new().from_block(0).to_block(299);
+
+        let err = fetch_logs_chunked(&provider, filter, 100)
+            .await
+            .expect_err("fail-fast must surface a mid-stream chunk error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("100-199"),
+            "error message must identify the failing chunk window 100-199; got {msg:?}"
         );
     }
 

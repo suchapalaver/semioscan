@@ -81,9 +81,13 @@ impl<P: Provider> EventScanner<P> {
         // is never produced. EventProcessingError is supplied only to satisfy
         // the type parameter.
         self.inner
-            .scan::<EventProcessingError, _>(chain, filter_template, start_block, end_block, |_| {
-                None
-            })
+            .scan::<EventProcessingError, _>(
+                chain,
+                filter_template,
+                start_block,
+                end_block,
+                |_, _, _| None,
+            )
             .await
     }
 
@@ -115,9 +119,13 @@ impl<P: Provider> EventScanner<P> {
 
         let logs = self
             .inner
-            .scan::<EventProcessingError, _>(chain, filter_template, start_block, end_block, |_| {
-                None
-            })
+            .scan::<EventProcessingError, _>(
+                chain,
+                filter_template,
+                start_block,
+                end_block,
+                |_, _, _| None,
+            )
             .await?;
 
         match handler(logs).await {
