@@ -543,6 +543,7 @@ impl policy::RpcPolicy for SemioscanConfig {
     fn rpc_config(&self, chain: NamedChain) -> policy::RpcConfig {
         policy::RpcConfig {
             rpc_timeout: self.get_rpc_timeout(chain),
+            rate_limit_delay: self.get_rate_limit_delay(chain),
         }
     }
 }

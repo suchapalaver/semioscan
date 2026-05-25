@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking Changes
 
+- The per-chain RPC settings surfaced by `RpcPolicy::rpc_config` now also
+  carry the chain's rate-limit delay alongside its request timeout.
+  Downstream policy implementations that return this configuration
+  via struct literal need to either add the new field or switch to the
+  helper constructor — `SemioscanConfig`'s own implementation keeps
+  working unchanged, and operators who only consume providers built
+  through the crate's builders see no migration. The type is now
+  marked `#[non_exhaustive]` so future per-chain RPC knobs can be
+  added without forcing another breaking change at this boundary.
 - `MaxBlockRange::chunk_range`, `MaxBlockRange::chunks_needed`, and the
   `ChunkIterator` type are no longer part of the public API. They had
   no in-crate caller after the chunked log path was consolidated onto
@@ -25,8 +34,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   advancing via `to_block.checked_add(1)` so the loop breaks when
   the chunk ends at `u64::MAX`). Closes #36.
 
+### Added
+
+- Endpoints added to a provider pool can now opt into minimum-delay
+  request pacing via `ChainEndpoint::with_min_delay`, mirroring the
+  setter that already existed for typed providers. Pools previously
+  exposed only the rate-limit-per-second and timeout knobs at the
+  endpoint level, so callers who wanted strict-upstream pacing had to
+  bypass the pool builder entirely; the setter now closes that gap.
+
 ### Fixed
 
+- Provider pools built through `ProviderPoolBuilder::with_rpc_policy`
+  now honour the policy's per-chain rate-limit delay. Operators who
+  configured `SemioscanConfigBuilder::chain_rate_limit(...)` or
+  `rate_limit_delay(...)` and routed the resulting config through the
+  pool builder were silently getting an unpaced provider — requests
+  fired back-to-back against strict upstreams and the configuration
+  had no observable effect on the wire. Per-chain pacing now reaches
+  the underlying transport with endpoint values taking precedence over
+  policy values, matching the existing precedence rule for timeouts.
+  The pool path also now flows through the same shared client builder
+  as the type-erased and typed factories, so a `(rate_limit_per_second,
+  min_delay, timeout)` configuration is dispatched identically wherever
+  a provider is built. Closes #47.
 - `create_typed_http_provider` now honours
   `ProviderConfig::with_min_delay`. Previously the typed factory branched
   only on `rate_limit_per_second` and silently dropped `min_delay`, so a

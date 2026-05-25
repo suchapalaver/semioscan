@@ -88,9 +88,9 @@ use tracing::{debug, info, warn};
 
 use crate::config::policy::RpcPolicy;
 use crate::errors::RpcError;
-use crate::transport::RateLimitLayer;
 
-use super::http_client::reqwest_client_with_timeout;
+use super::config::ProviderConfig;
+use super::factory::build_http_client;
 
 /// Type alias for a pooled provider using `AnyNetwork`
 pub type PooledProvider = Arc<RootProvider<AnyNetwork>>;
@@ -174,7 +174,8 @@ impl ProviderPool {
     ///
     /// The per-request timeout is taken from the pool's default
     /// (see [`with_default_timeout`](Self::with_default_timeout)).
-    /// Use [`add_endpoint`](Self::add_endpoint) to set a per-chain timeout.
+    /// Use [`add_endpoint`](Self::add_endpoint) to set a per-chain timeout
+    /// or minimum-delay pacing.
     ///
     /// # Errors
     ///
@@ -185,13 +186,13 @@ impl ProviderPool {
         url: &str,
         rate_limit: Option<u32>,
     ) -> Result<(), RpcError> {
-        self.add_inner(chain, url, rate_limit, None)
+        self.add_inner(chain, url, rate_limit, None, None)
     }
 
     /// Add a chain endpoint to the pool.
     ///
-    /// Uses the endpoint's `rate_limit` and `timeout` when set, otherwise
-    /// falls back to the pool defaults.
+    /// Uses the endpoint's `rate_limit`, `timeout`, and `min_delay` when
+    /// set, otherwise falls back to the pool defaults.
     ///
     /// # Errors
     ///
@@ -202,6 +203,7 @@ impl ProviderPool {
             &endpoint.url,
             endpoint.rate_limit,
             endpoint.timeout,
+            endpoint.min_delay,
         )
     }
 
@@ -211,11 +213,13 @@ impl ProviderPool {
         url: &str,
         rate_limit: Option<u32>,
         timeout: Option<Duration>,
+        min_delay: Option<Duration>,
     ) -> Result<(), RpcError> {
         let provider = create_pooled_provider(
             url,
             rate_limit.or(self.default_rate_limit),
             timeout.or(self.default_timeout),
+            min_delay,
         )?;
 
         let mut providers = self.providers.write().map_err(|_| {
@@ -327,6 +331,7 @@ pub struct ProviderPoolBuilder {
     default_rate_limit: Option<u32>,
     default_timeout: Option<Duration>,
     rpc_policy_timeouts: HashMap<NamedChain, Duration>,
+    rpc_policy_min_delays: HashMap<NamedChain, Duration>,
 }
 
 impl ProviderPoolBuilder {
@@ -390,21 +395,29 @@ impl ProviderPoolBuilder {
         self
     }
 
-    /// Apply per-chain timeouts from an [`RpcPolicy`].
+    /// Apply per-chain settings from an [`RpcPolicy`].
     ///
     /// The policy is evaluated for every endpoint that has already been
     /// added to the builder; call this **after** all `add_chain*` /
-    /// `add_endpoint` calls for the timeout to take effect. Endpoints
-    /// added after this call do **not** pick up the policy timeout —
-    /// call `with_rpc_policy` again to refresh. A per-endpoint `timeout`
-    /// always wins; the builder's `default_timeout` is the fallback when
-    /// neither the endpoint nor the policy supplies one for a chain.
+    /// `add_endpoint` calls for the policy to take effect. Endpoints added
+    /// after this call do **not** pick up the policy values — call
+    /// `with_rpc_policy` again to refresh.
+    ///
+    /// For each axis the policy supplies (`rpc_timeout`, `rate_limit_delay`),
+    /// a per-endpoint value always wins; the builder's `default_timeout`
+    /// is the fallback when neither the endpoint nor the policy supplies
+    /// a timeout for a chain. There is no pool-level default for the
+    /// minimum-delay pacing axis, so a chain with no endpoint `min_delay`
+    /// and no policy `rate_limit_delay` simply runs unpaced.
     #[must_use]
     pub fn with_rpc_policy<P: RpcPolicy>(mut self, policy: &P) -> Self {
         for endpoint in &self.endpoints {
             let cfg = policy.rpc_config(endpoint.chain);
             self.rpc_policy_timeouts
                 .insert(endpoint.chain, cfg.rpc_timeout);
+            if let Some(delay) = cfg.rate_limit_delay {
+                self.rpc_policy_min_delays.insert(endpoint.chain, delay);
+            }
         }
         self
     }
@@ -423,11 +436,13 @@ impl ProviderPoolBuilder {
 
         for endpoint in &self.endpoints {
             let policy_timeout = self.rpc_policy_timeouts.get(&endpoint.chain).copied();
+            let policy_min_delay = self.rpc_policy_min_delays.get(&endpoint.chain).copied();
             let effective = ChainEndpoint {
                 chain: endpoint.chain,
                 url: endpoint.url.clone(),
                 rate_limit: endpoint.rate_limit.or(self.default_rate_limit),
                 timeout: endpoint.timeout.or(policy_timeout),
+                min_delay: endpoint.min_delay.or(policy_min_delay),
             };
             pool.add_endpoint(&effective)?;
         }
@@ -454,6 +469,12 @@ pub struct ChainEndpoint {
     /// Optional per-request timeout override for this specific chain.
     /// When `None`, the pool's default timeout (if any) is used.
     pub timeout: Option<Duration>,
+    /// Optional minimum spacing between requests for this specific chain.
+    /// When set, the underlying transport installs a minimum-delay layer
+    /// that guarantees at least this gap between consecutive RPC calls.
+    /// When `None`, the policy's per-chain `rate_limit_delay` (if any)
+    /// supplies the value at build time.
+    pub min_delay: Option<Duration>,
 }
 
 impl ChainEndpoint {
@@ -465,6 +486,7 @@ impl ChainEndpoint {
             url: url.into(),
             rate_limit: None,
             timeout: None,
+            min_delay: None,
         }
     }
 
@@ -479,6 +501,17 @@ impl ChainEndpoint {
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
+        self
+    }
+
+    /// Override the minimum spacing between requests for this chain.
+    ///
+    /// Mirrors [`ProviderConfig::with_min_delay`](crate::provider::ProviderConfig::with_min_delay):
+    /// the underlying transport installs a layer that guarantees at least
+    /// `delay` between consecutive RPC calls.
+    #[must_use]
+    pub fn with_min_delay(mut self, delay: Duration) -> Self {
+        self.min_delay = Some(delay);
         self
     }
 
@@ -519,10 +552,13 @@ impl ChainEndpoint {
     }
 }
 
-/// Create a pooled provider with optional rate limiting
+/// Create a pooled provider with optional rate limiting and pacing.
 ///
-/// Returns a bare `RootProvider` without fillers, as fillers are typically
-/// application-specific and should be added by the consumer if needed.
+/// Routes through the shared HTTP client builder so the
+/// `(rate_limit_per_second, min_delay, timeout)` dispatch matrix matches
+/// every other HTTP provider this crate hands out. Returns a bare
+/// `RootProvider` without fillers, as fillers are application-specific
+/// and should be added by the consumer if needed.
 ///
 /// Note: RPC request/response logging is handled natively by alloy's transport
 /// layer at DEBUG/TRACE level.
@@ -530,26 +566,20 @@ fn create_pooled_provider(
     url: &str,
     rate_limit: Option<u32>,
     timeout: Option<Duration>,
+    min_delay: Option<Duration>,
 ) -> Result<RootProvider<AnyNetwork>, RpcError> {
-    let parsed_url: url::Url = url.parse().map_err(|e| {
+    let mut config = ProviderConfig::new(url).with_rate_limit_opt(rate_limit);
+    if let Some(t) = timeout {
+        config = config.with_timeout(t);
+    }
+    if let Some(d) = min_delay {
+        config = config.with_min_delay(d);
+    }
+
+    let client = build_http_client(config).inspect_err(|e| {
         warn!(url = url, error = ?e, "Invalid provider URL");
-        RpcError::ProviderUrlInvalid(url.to_string())
     })?;
 
-    let builder = rate_limit.map(|limit| {
-        alloy_rpc_client::ClientBuilder::default().layer(RateLimitLayer::per_second(limit))
-    });
-
-    let client = match (builder, timeout) {
-        (Some(b), Some(t)) => b.http_with_client(reqwest_client_with_timeout(t)?, parsed_url),
-        (Some(b), None) => b.http(parsed_url),
-        (None, Some(t)) => alloy_rpc_client::ClientBuilder::default()
-            .http_with_client(reqwest_client_with_timeout(t)?, parsed_url),
-        (None, None) => alloy_rpc_client::ClientBuilder::default().http(parsed_url),
-    };
-
-    // Create a bare provider without fillers - fillers are application-specific
-    // and should be added by consumers if needed
     Ok(RootProvider::<AnyNetwork>::new(client))
 }
 
@@ -651,16 +681,23 @@ mod tests {
     fn with_rpc_policy_only_covers_chains_added_before_it() {
         use crate::config::policy::RpcConfig;
 
-        struct FixedTimeout(Duration);
-        impl RpcPolicy for FixedTimeout {
+        struct FixedPolicy {
+            timeout: Duration,
+            rate_limit_delay: Option<Duration>,
+        }
+        impl RpcPolicy for FixedPolicy {
             fn rpc_config(&self, _: NamedChain) -> RpcConfig {
                 RpcConfig {
-                    rpc_timeout: self.0,
+                    rpc_timeout: self.timeout,
+                    rate_limit_delay: self.rate_limit_delay,
                 }
             }
         }
 
-        let policy = FixedTimeout(Duration::from_secs(5));
+        let policy = FixedPolicy {
+            timeout: Duration::from_secs(5),
+            rate_limit_delay: Some(Duration::from_millis(250)),
+        };
 
         let before = ProviderPoolBuilder::new()
             .add_chain(NamedChain::Mainnet, "http://localhost:8545")
@@ -671,7 +708,15 @@ mod tests {
                 .get(&NamedChain::Mainnet)
                 .copied(),
             Some(Duration::from_secs(5)),
-            "policy must apply when chain is added before with_rpc_policy",
+            "policy timeout must apply when chain is added before with_rpc_policy",
+        );
+        assert_eq!(
+            before
+                .rpc_policy_min_delays
+                .get(&NamedChain::Mainnet)
+                .copied(),
+            Some(Duration::from_millis(250)),
+            "policy rate_limit_delay must apply when chain is added before with_rpc_policy",
         );
 
         let after = ProviderPoolBuilder::new()
@@ -679,7 +724,13 @@ mod tests {
             .add_chain(NamedChain::Mainnet, "http://localhost:8545");
         assert!(
             !after.rpc_policy_timeouts.contains_key(&NamedChain::Mainnet),
-            "policy must not apply when chain is added after with_rpc_policy",
+            "policy timeout must not apply when chain is added after with_rpc_policy",
+        );
+        assert!(
+            !after
+                .rpc_policy_min_delays
+                .contains_key(&NamedChain::Mainnet),
+            "policy rate_limit_delay must not apply when chain is added after with_rpc_policy",
         );
     }
 }

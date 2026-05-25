@@ -58,13 +58,41 @@ pub struct LookupConfig {
 ///
 /// Provider factories (`create_http_provider`, `ProviderPoolBuilder`) apply
 /// `rpc_timeout` to the underlying HTTP transport so a single hung request
-/// cannot block a calling task indefinitely. Other RPC concerns (rate
-/// limiting, chunk sizes) live in [`ScanConfig`] and on
-/// [`ProviderConfig`](crate::provider::ProviderConfig) itself.
+/// cannot block a calling task indefinitely. When `rate_limit_delay` is set,
+/// the same factories install a minimum-delay layer so requests for that
+/// chain are paced at least that far apart.
+///
+/// `#[non_exhaustive]` so future per-chain RPC settings can be added without
+/// breaking struct-literal construction in downstream policy implementations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RpcConfig {
     /// Per-request timeout for RPC calls.
     pub rpc_timeout: Duration,
+    /// Minimum spacing between RPC calls, when the policy wants the provider
+    /// to throttle requests for this chain. `None` leaves the provider
+    /// unthrottled (a per-endpoint `min_delay` on the pool can still install
+    /// a layer).
+    pub rate_limit_delay: Option<Duration>,
+}
+
+impl RpcConfig {
+    /// Construct an `RpcConfig` with the given timeout and no rate-limit
+    /// delay. Use the `with_*` setters to populate additional fields.
+    #[must_use]
+    pub fn new(rpc_timeout: Duration) -> Self {
+        Self {
+            rpc_timeout,
+            rate_limit_delay: None,
+        }
+    }
+
+    /// Set the minimum spacing between RPC calls for this chain.
+    #[must_use]
+    pub fn with_rate_limit_delay(mut self, delay: Duration) -> Self {
+        self.rate_limit_delay = Some(delay);
+        self
+    }
 }
 
 /// Resolves a [`ScanConfig`] for a given chain.
