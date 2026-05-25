@@ -1006,13 +1006,24 @@ where
         "Computing daily block window"
     );
 
-    // The day touches or sits past the chain tip when the last second of
-    // the day is at or after the memoized head's timestamp. Whichever
-    // branch we take below, we must not persist the result: a future
-    // chain advance will produce a different (correct) window for the
-    // same `(chain, date)` cache key.
-    let day_touches_tip =
-        memoized_latest_ts.is_some_and(|latest_ts| end_ts_exclusive.pred() >= latest_ts);
+    // We can confirm a window is safe to persist only when the memoized
+    // head's timestamp tells us the day ends strictly before the tip.
+    // Two cases force a skip:
+    //   1. `latest_ts` is known and the day touches or extends past the
+    //      tip — future blocks will land in the day's range and the
+    //      cached entry would silently go stale (the same shape pinned
+    //      by #13 / PR #13).
+    //   2. `latest_ts` is `None` — i.e. the head entry is partial,
+    //      populated by [`ChainBoundsMemo::get_or_fetch_latest_block`]
+    //      with the block number but no timestamp. Without `latest_ts`
+    //      we cannot distinguish a fully-historical day from one whose
+    //      head sits inside the requested day. The conservative shape
+    //      is to refuse to cache: the caller still gets a best-effort
+    //      window (the binary search runs in the else-branch below),
+    //      they just pay one extra binary search on a subsequent cold
+    //      restart for the same date. See #14.
+    let safe_to_cache =
+        memoized_latest_ts.is_some_and(|latest_ts| end_ts_exclusive.pred() < latest_ts);
 
     let window = if memoized_latest_ts.is_some_and(|latest_ts| start_ts > latest_ts) {
         // Date is entirely past the chain tip. Mirror the empty-window
@@ -1044,21 +1055,26 @@ where
         end_block = window.end_block,
         block_count = window.block_count().as_u64(),
         cache = %cache.name(),
-        cached = !day_touches_tip,
+        cached = safe_to_cache,
         "Computed daily block window"
     );
 
-    if day_touches_tip {
+    if safe_to_cache {
+        if let Err(e) = cache.insert(key, window.clone()).await {
+            debug!(error = %e, "Failed to cache block window (continuing anyway)");
+        }
+    } else {
         cache.record_skip_insert().await;
         debug!(
             chain = %chain,
             date = %date,
-            "Skipping cache insert: window touches or extends past chain tip — \
-             future blocks may shift the day's range, and the (chain, date) \
-             cache key cannot disambiguate which head was current"
+            latest_ts = ?memoized_latest_ts,
+            "Skipping cache insert: cannot confirm the window is safe to \
+             persist. Either the day touches or extends past the chain tip, \
+             or the head's timestamp is unknown (partial memo from \
+             get_or_fetch_latest_block). The (chain, date) cache key cannot \
+             disambiguate which head was current"
         );
-    } else if let Err(e) = cache.insert(key, window.clone()).await {
-        debug!(error = %e, "Failed to cache block window (continuing anyway)");
     }
 
     Ok(window)
@@ -2399,13 +2415,17 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn daily_window_cold_memo_still_caches_historical_date() {
-            // Cold memo, fully historical date. The fix must not regress this
-            // path — without a memoized `latest_ts`, the short-circuits cannot
-            // fire and the cache insert must proceed as before. (If a future
-            // fix wants to gate caching on a sentinel check too, it should
-            // come from a separate decision; this test pins down today's
-            // behaviour.)
+        async fn daily_window_cold_memo_does_not_cache_historical_date() {
+            // Cold memo, fixture in which the day is in fact fully historical
+            // (head ts=1_735_776_100 sits just past the day's
+            // end_ts_exclusive=1_735_776_000). The point of this test is that
+            // `get_daily_window_with` cannot know that without `latest_ts` in
+            // the memo — `get_or_fetch_latest_block` leaves the partial entry
+            // with `latest_ts = None` — and so it must conservatively skip
+            // the cache insert. The cost is one extra binary search on a
+            // subsequent cold restart for the same date; the win is that the
+            // silent-truncation case (head ts INSIDE the day; see sibling
+            // test below) can no longer poison the disk cache.
             let timestamps = vec![
                 1_735_689_500,
                 1_735_689_700,
@@ -2431,16 +2451,93 @@ mod tests {
             .await
             .unwrap();
 
+            // The binary search still returns an honest window — the caller
+            // gets the right answer, it just doesn't get persisted.
             assert_eq!((window.start_block, window.end_block), (1, 3));
+            assert!(
+                !log.lock().unwrap().is_empty(),
+                "binary search must still run on the cold-memo path — the \
+                 caller gets a usable window even when caching is refused"
+            );
             let stats = cache.stats().await;
             assert_eq!(
-                stats.entries, 1,
-                "cold-memo historical date must still populate the cache"
+                stats.entries, 0,
+                "cold memo (no latest_ts) must refuse to cache — the same \
+                 (chain, date) key may produce a different window once \
+                 latest_ts is available, and we cannot distinguish a \
+                 genuinely-historical day from one whose head ts is \
+                 inside the day"
             );
             assert_eq!(
-                stats.skip_inserts, 0,
-                "cold-memo historical date must not touch the skip counter — \
-                 the insert was successful, not skipped"
+                stats.skip_inserts, 1,
+                "cold-memo cache skip is deliberate and must increment \
+                 skip_inserts so the count surfaces in operator metrics"
+            );
+        }
+
+        #[tokio::test]
+        async fn daily_window_cold_memo_does_not_cache_when_head_ts_inside_day() {
+            // Failure scenario from issue #14: a daily reconciliation
+            // starts from a cold `BlockWindowCalculator` and asks for
+            // today's window. The chain is mid-day — the actual head's
+            // timestamp falls INSIDE the requested day —
+            // `get_or_fetch_latest_block` returns the head's block
+            // number but no `latest_ts`, and the binary search clamps
+            // `end_block` to the head. Pre-fix that truncated window
+            // would be persisted to the disk cache (no TTL by default)
+            // and shadow the correct window indefinitely.
+            //
+            // 2025-01-01 UTC: start_ts=1_735_689_600,
+            // end_ts_exclusive=1_735_776_000. Block 4 (head) has
+            // ts=1_735_750_000 — strictly inside the day.
+            let timestamps = vec![
+                1_735_689_500, // block 0 — before the day
+                1_735_689_700, // block 1 — first block on the day
+                1_735_720_000, // block 2 — mid-day
+                1_735_745_000, // block 3 — mid-day
+                1_735_750_000, // block 4 — head, still inside the day
+            ];
+            let bounds_memo = ChainBoundsMemo::new(DEFAULT_HEAD_TTL);
+            let cache = crate::blocks::cache::MemoryCache::new();
+            let date = NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
+
+            let log = Arc::new(StdMutex::new(Vec::<BlockNumber>::new()));
+            let head_counter = Arc::new(AtomicUsize::new(0));
+
+            let window = get_daily_window_with(
+                &bounds_memo,
+                &cache,
+                NamedChain::Arbitrum,
+                date,
+                counting_fetch_ts(timestamps, log.clone()),
+                counting_fetch_head(4, head_counter.clone()),
+            )
+            .await
+            .unwrap();
+
+            // The binary search produces the truncated window — `end_block`
+            // clamps to the head because the day extends past every probed
+            // block. The window value is fine to return to the caller this
+            // turn (they explicitly asked for "today"); the bug was
+            // persisting it.
+            assert_eq!((window.start_block, window.end_block), (1, 4));
+            assert!(
+                !log.lock().unwrap().is_empty(),
+                "binary search must still run — the caller asked for the \
+                 day and is entitled to the best-effort window"
+            );
+            let stats = cache.stats().await;
+            assert_eq!(
+                stats.entries, 0,
+                "tip-touching window must not be cached — future blocks \
+                 will land inside the day's range and the persisted entry \
+                 would shadow the correct window indefinitely (the disk \
+                 cache has no TTL by default)"
+            );
+            assert_eq!(
+                stats.skip_inserts, 1,
+                "cold-memo tip-touching skip is deliberate and must \
+                 increment skip_inserts"
             );
         }
 
