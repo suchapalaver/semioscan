@@ -9,15 +9,15 @@ use alloy_provider::{network::eip2718::Typed2718, Provider};
 use alloy_rpc_types::{Filter, Log, TransactionTrait};
 use alloy_sol_types::SolEvent;
 use op_alloy_network::Optimism;
-use tokio::time::sleep;
 
 use crate::errors::{GasCalculationError, RpcError};
 use crate::events::definitions::{Approval, Transfer};
 use crate::gas::adapter::{EthereumReceiptAdapter, OptimismReceiptAdapter, ReceiptAdapter};
 use crate::gas::calculator::{GasCostCalculator, GasCostResult, GasForTx};
 use crate::gas::transaction;
+use crate::scan::LogScanner;
 use crate::tracing::spans;
-use tracing::{error, info, trace, Instrument};
+use tracing::{error, info, Instrument};
 
 /// Type of ERC-20 event for gas calculation
 ///
@@ -117,13 +117,12 @@ mod gas_calc_core {
         effective_gas_price
     }
 
-    /// Create an event filter for the given parameters
+    /// Create an event filter template for the given parameters.
     ///
-    /// This unified function replaces create_transfer_filter and create_approval_filter.
+    /// The block range is intentionally omitted — [`LogScanner`] stamps each
+    /// chunk's `from_block`/`to_block` onto a clone of this template.
     pub(super) fn create_event_filter(
         event_type: EventType,
-        current_block: BlockNumber,
-        to_block: BlockNumber,
         token: Address,
         topic1: Address,
         topic2: Address,
@@ -131,8 +130,6 @@ mod gas_calc_core {
         let event_topic = event_type.signature_hash();
 
         Filter::new()
-            .from_block(current_block)
-            .to_block(to_block)
             .address(token)
             .event_signature(vec![event_topic])
             .topic1(topic1)
@@ -252,75 +249,37 @@ where
         );
         async {
             let mut result = GasCostResult::new(chain, topic1_addr, topic2_addr);
-            let mut current_block = from_block;
-
-            let max_block_range = self.config.get_max_block_range(chain);
-            let rate_limit = self.config.get_rate_limit_delay(chain);
 
             info!(
                 event_type = event_type.name(),
                 total_blocks = to_block.saturating_sub(from_block) + 1,
-                max_block_range = max_block_range.as_u64(),
+                max_block_range = self.config.get_max_block_range(chain).as_u64(),
                 "Starting log processing"
             );
 
-            let mut total_logs = 0;
-            let mut chunk_count = 0;
+            let filter_template =
+                gas_calc_core::create_event_filter(event_type, token, topic1_addr, topic2_addr);
 
-            while current_block <= to_block {
-                let chunk_end =
-                    std::cmp::min(current_block + max_block_range.as_u64() - 1, to_block);
-                chunk_count += 1;
-
-                let filter = gas_calc_core::create_event_filter(
-                    event_type,
-                    current_block,
-                    chunk_end,
-                    token,
-                    topic1_addr,
-                    topic2_addr,
-                );
-
-                let logs = self.provider.get_logs(&filter).await.map_err(|e| {
-                    RpcError::get_logs_failed(
-                        format!(
-                            "{event_name} events from block {current_block} to {chunk_end}",
-                            event_name = event_type.name()
-                        ),
+            let scanner = LogScanner::new(&self.provider, self.config.clone());
+            let event_name = event_type.name();
+            let logs = scanner
+                .scan::<GasCalculationError, _>(chain, filter_template, from_block, to_block, |e| {
+                    Some(GasCalculationError::from(RpcError::get_logs_failed(
+                        format!("{event_name} events from block {from_block} to {to_block}"),
                         e,
-                    )
-                })?;
-                total_logs += logs.len();
+                    )))
+                })
+                .await?;
 
-                trace!(
-                    event_type = event_type.name(),
-                    logs_count = logs.len(),
-                    current_block,
-                    to_block = chunk_end,
-                    chunk = chunk_count,
-                    "Fetched logs for gas cost calculation"
-                );
-
-                for log in &logs {
-                    // Decode and process the log
-                    event_type.decode_and_log(log, current_block)?;
-                    self.handle_log(log, &mut result, adapter).await?;
-                }
-
-                current_block = chunk_end + 1;
-
-                // Apply rate limiting if configured for this chain
-                if let Some(delay) = rate_limit {
-                    if current_block <= to_block {
-                        sleep(delay).await;
-                    }
-                }
+            for log in &logs {
+                let log_block = log.block_number.unwrap_or(from_block);
+                event_type.decode_and_log(log, log_block)?;
+                self.handle_log(log, &mut result, adapter).await?;
             }
 
             info!(
                 event_type = event_type.name(),
-                total_logs,
-                total_chunks = chunk_count,
+                total_logs = logs.len(),
                 total_transactions = result.transaction_count.as_usize(),
                 total_gas_cost = %result.total_gas_cost,
                 "Completed log processing"
@@ -637,38 +596,29 @@ mod tests {
     }
 
     #[test]
-    fn test_create_transfer_filter_structure() {
-        // Test that create_event_filter creates a filter with the correct structure for Transfer events
+    fn test_create_transfer_filter_template_omits_block_range() {
         let token = Address::ZERO;
         let from = Address::from([0x11; 20]);
         let to = Address::from([0x22; 20]);
 
-        let filter =
-            gas_calc_core::create_event_filter(EventType::Transfer, 100, 200, token, from, to);
+        let filter = gas_calc_core::create_event_filter(EventType::Transfer, token, from, to);
 
-        // Filter should be configured for the correct address
-        // (We can't easily inspect the filter internals without additional dependencies)
-        let _ = filter; // Use the filter to avoid unused warning
+        // The template intentionally omits block range; LogScanner stamps each
+        // chunk's range onto a clone.
+        assert_eq!(filter.get_from_block(), None);
+        assert_eq!(filter.get_to_block(), None);
     }
 
     #[test]
-    fn test_create_approval_filter_structure() {
-        // Test that create_event_filter creates a filter with the correct structure for Approval events
+    fn test_create_approval_filter_template_omits_block_range() {
         let token = Address::ZERO;
         let owner = Address::from([0x11; 20]);
         let spender = Address::from([0x22; 20]);
 
-        let filter = gas_calc_core::create_event_filter(
-            EventType::Approval,
-            100,
-            200,
-            token,
-            owner,
-            spender,
-        );
+        let filter = gas_calc_core::create_event_filter(EventType::Approval, token, owner, spender);
 
-        // Filter should be configured for the correct address
-        let _ = filter; // Use the filter to avoid unused warning
+        assert_eq!(filter.get_from_block(), None);
+        assert_eq!(filter.get_to_block(), None);
     }
 
     #[test]

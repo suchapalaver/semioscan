@@ -15,9 +15,9 @@ use tracing::{error, info, warn};
 
 use crate::config::SemioscanConfig;
 use crate::errors::PriceCalculationError;
-use crate::events::scanner::EventScanner;
 use crate::price::cache::PriceCache;
 use crate::price::{PriceSource, PriceSourceError, SwapData};
+use crate::scan::LogScanner;
 use crate::{NormalizedAmount, TokenAmount, TokenDecimals, TokenPrice, TransactionCount, UsdValue};
 
 // Internal type for swap data processing
@@ -341,23 +341,17 @@ impl<P: Provider + Clone> PriceCalculator<P> {
         let mut gap_result = TokenPriceResult::new(token_address);
         let event_topics = self.price_source.event_topics();
 
-        // Create a scanner to handle chunking and rate limiting
-        let scanner = EventScanner::new(&self.provider, self.config.clone());
+        let scanner = LogScanner::new(&self.provider, self.config.clone());
 
-        // Build a filter for swap events from the price source
         let filter = Filter::new()
             .address(self.price_source.router_address())
             .event_signature(event_topics.clone());
 
-        // Scan for all swap events in this gap
+        // Continue-on-error: missing a chunk reduces coverage but does not
+        // fail the price calculation.
         let logs = scanner
-            .scan(self.chain, filter, gap_start, gap_end)
-            .await
-            .map_err(|e| {
-                PriceCalculationError::processing_failed(format!(
-                    "Failed to scan swap events from {gap_start} to {gap_end}: {e}"
-                ))
-            })?;
+            .scan::<PriceCalculationError, _>(self.chain, filter, gap_start, gap_end, |_| None)
+            .await?;
 
         info!(
             logs_count = logs.len(),
@@ -590,23 +584,17 @@ impl<P: Provider + Clone> PriceCalculator<P> {
 
         let event_topics = self.price_source.event_topics();
 
-        // Create a scanner to handle chunking and rate limiting
-        let scanner = EventScanner::new(&self.provider, self.config.clone());
+        let scanner = LogScanner::new(&self.provider, self.config.clone());
 
-        // Build a filter for swap events from the price source
         let filter = Filter::new()
             .address(self.price_source.router_address())
             .event_signature(event_topics.clone());
 
-        // Scan for all swap events in this range
+        // Continue-on-error: missing a chunk reduces coverage but does not
+        // fail the raw-swap extraction.
         let logs = scanner
-            .scan(self.chain, filter, start_block, end_block)
-            .await
-            .map_err(|e| {
-                PriceCalculationError::processing_failed(format!(
-                    "Failed to scan swap events from {start_block} to {end_block}: {e}"
-                ))
-            })?;
+            .scan::<PriceCalculationError, _>(self.chain, filter, start_block, end_block, |_| None)
+            .await?;
 
         info!(
             logs_count = logs.len(),
