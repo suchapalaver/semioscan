@@ -31,25 +31,11 @@ use crate::config::SemioscanConfig;
 /// [`LogScanner::scan`]: returning `None` continues with the next chunk,
 /// returning `Some(err)` aborts the scan with that error.
 ///
-/// # Examples
-///
-/// ```rust,ignore
-/// use semioscan::{SemioscanConfig, scan::LogScanner};
-/// use alloy_chains::NamedChain;
-/// use alloy_rpc_types::Filter;
-///
-/// let scanner = LogScanner::new(provider, SemioscanConfig::default());
-/// let logs = scanner
-///     .scan::<std::convert::Infallible, _>(
-///         NamedChain::Base,
-///         Filter::new(),
-///         1_000_000,
-///         1_100_000,
-///         |_| None, // continue-on-error
-///     )
-///     .await
-///     .expect("infallible");
-/// ```
+/// This type is crate-internal. External consumers reach the same
+/// functionality through [`crate::events::EventScanner`] (which fixes the
+/// policy to continue-on-error) or through `GasCostCalculator` /
+/// `CombinedCalculator` / `PriceCalculator`, each of which picks the
+/// per-chunk error policy that matches its domain.
 pub struct LogScanner<P, N: Network = Ethereum> {
     provider: P,
     config: SemioscanConfig,
@@ -122,9 +108,7 @@ where
             // `MAX - 1 < current_block` when `current_block == u64::MAX`,
             // making the loop fail to advance. (`chunk_size > 0` is asserted
             // above, so the subtraction never underflows the chunk semantics.)
-            let to_block = current_block
-                .saturating_add(chunk_size - 1)
-                .min(end_block);
+            let to_block = current_block.saturating_add(chunk_size - 1).min(end_block);
 
             let filter = filter_template
                 .clone()
@@ -547,6 +531,124 @@ mod tests {
             .expect("scan must terminate even when end_block == u64::MAX");
 
         assert_eq!(transport.call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn continue_on_error_returns_empty_when_every_chunk_fails() {
+        let transport = ScriptedTransport::default();
+        for _ in 0..3 {
+            transport.push_failure("eth_getLogs", "down");
+        }
+
+        let provider = build_provider(transport.clone());
+        let scanner = LogScanner::new(provider, config_with_chunk_size(100));
+
+        let logs = scanner
+            .scan::<std::convert::Infallible, _>(
+                NamedChain::Arbitrum,
+                Filter::new(),
+                0,
+                299,
+                |_| None,
+            )
+            .await
+            .expect("continue policy must not surface chunk errors");
+
+        assert!(logs.is_empty(), "all chunks failed; logs vec must be empty");
+        assert_eq!(
+            transport.call_count(),
+            3,
+            "every chunk must still be attempted"
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limit_delay_applied_between_failed_chunks_under_continue() {
+        // A continue-on-error scan must still pace itself between chunks
+        // even when chunks fail — otherwise an outage at the provider would
+        // turn into an instant retry storm.
+        let transport = ScriptedTransport::default();
+        transport.push_failure("eth_getLogs", "down");
+        transport.push_failure("eth_getLogs", "down");
+
+        let provider = build_provider(transport.clone());
+        let delay = Duration::from_millis(120);
+        let config = SemioscanConfigBuilder::with_defaults()
+            .chain_max_blocks(NamedChain::Arbitrum, 100)
+            .chain_rate_limit(NamedChain::Arbitrum, delay)
+            .build();
+        let scanner = LogScanner::new(provider, config);
+
+        scanner
+            .scan::<std::convert::Infallible, _>(
+                NamedChain::Arbitrum,
+                Filter::new(),
+                0,
+                199,
+                |_| None,
+            )
+            .await
+            .unwrap();
+
+        let instants = transport.call_instants();
+        assert_eq!(instants.len(), 2);
+        let gap = instants[1].duration_since(instants[0]);
+        assert!(
+            gap >= delay,
+            "rate-limit delay must apply between failed chunks; observed {gap:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_fast_aborts_on_second_chunk_when_first_succeeds() {
+        // The fail_fast_aborts_on_first_chunk_error test covered the first
+        // chunk; this confirms the same policy works mid-stream, and that
+        // the closure is given the actual transport error from the failing
+        // chunk (not from a previous successful one).
+        let transport = ScriptedTransport::default();
+        transport.push_success("eth_getLogs", &vec![dummy_log()]);
+        transport.push_failure("eth_getLogs", "boom on chunk two");
+        transport.push_success("eth_getLogs", &empty_log_response());
+
+        let provider = build_provider(transport.clone());
+        let scanner = LogScanner::new(provider, config_with_chunk_size(100));
+
+        let result = scanner
+            .scan::<&'static str, _>(NamedChain::Arbitrum, Filter::new(), 0, 299, |_| {
+                Some("aborted on second chunk")
+            })
+            .await;
+
+        assert_eq!(result, Err("aborted on second chunk"));
+        assert_eq!(
+            transport.call_count(),
+            2,
+            "fail-fast must not attempt chunks after the failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn event_scanner_wrapper_skips_failed_chunks() {
+        // Integration test: confirm the public EventScanner wrapper actually
+        // routes through LogScanner with continue-on-error policy. Without
+        // this, a future refactor could silently flip the policy.
+        use crate::events::EventScanner;
+
+        let transport = ScriptedTransport::default();
+        transport.push_success("eth_getLogs", &vec![dummy_log()]);
+        transport.push_failure("eth_getLogs", "transient");
+        transport.push_success("eth_getLogs", &vec![dummy_log(), dummy_log()]);
+
+        let provider = build_provider(transport.clone());
+        let scanner = EventScanner::new(provider, config_with_chunk_size(100));
+
+        let logs = scanner
+            .scan(NamedChain::Arbitrum, Filter::new(), 0, 299)
+            .await
+            .expect("EventScanner must surface continue-on-error semantics");
+
+        assert_eq!(logs.len(), 3, "logs from surviving chunks must be returned");
+        assert_eq!(transport.call_count(), 3);
     }
 
     #[tokio::test]
