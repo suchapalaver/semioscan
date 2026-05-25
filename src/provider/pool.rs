@@ -83,10 +83,14 @@ use alloy_network::AnyNetwork;
 use alloy_provider::RootProvider;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use tracing::{debug, info, warn};
 
+use crate::config::policy::RpcPolicy;
 use crate::errors::RpcError;
 use crate::transport::RateLimitLayer;
+
+use super::http_client::reqwest_client_with_timeout;
 
 /// Type alias for a pooled provider using `AnyNetwork`
 pub type PooledProvider = Arc<RootProvider<AnyNetwork>>;
@@ -107,6 +111,10 @@ pub struct ProviderPool {
     providers: RwLock<HashMap<NamedChain, PooledProvider>>,
     /// Default rate limit for new providers (requests per second)
     default_rate_limit: Option<u32>,
+    /// Default per-request timeout for new providers.
+    /// When neither this nor the per-endpoint `timeout` is set, the
+    /// underlying transport's default timeout applies.
+    default_timeout: Option<Duration>,
 }
 
 impl ProviderPool {
@@ -116,6 +124,7 @@ impl ProviderPool {
         Self {
             providers: RwLock::new(HashMap::new()),
             default_rate_limit: None,
+            default_timeout: None,
         }
     }
 
@@ -125,7 +134,16 @@ impl ProviderPool {
         Self {
             providers: RwLock::new(HashMap::new()),
             default_rate_limit: rate_limit,
+            default_timeout: None,
         }
+    }
+
+    /// Set the default per-request timeout used when an endpoint does not
+    /// override its own.
+    #[must_use]
+    pub fn with_default_timeout(mut self, timeout: Duration) -> Self {
+        self.default_timeout = Some(timeout);
+        self
     }
 
     /// Create a pool from a list of chain endpoints
@@ -139,11 +157,7 @@ impl ProviderPool {
     ) -> Result<Self, RpcError> {
         let pool = Self::with_defaults(rate_limit);
         for endpoint in endpoints {
-            pool.add(
-                endpoint.chain,
-                &endpoint.url,
-                endpoint.rate_limit.or(rate_limit),
-            )?;
+            pool.add_endpoint(&endpoint)?;
         }
         Ok(pool)
     }
@@ -158,6 +172,10 @@ impl ProviderPool {
     /// * `url` - The RPC endpoint URL
     /// * `rate_limit` - Optional rate limit in requests per second
     ///
+    /// The per-request timeout is taken from the pool's default
+    /// (see [`with_default_timeout`](Self::with_default_timeout)).
+    /// Use [`add_endpoint`](Self::add_endpoint) to set a per-chain timeout.
+    ///
     /// # Errors
     ///
     /// Returns an error if the URL is invalid
@@ -167,7 +185,38 @@ impl ProviderPool {
         url: &str,
         rate_limit: Option<u32>,
     ) -> Result<(), RpcError> {
-        let provider = create_pooled_provider(url, rate_limit.or(self.default_rate_limit))?;
+        self.add_inner(chain, url, rate_limit, None)
+    }
+
+    /// Add a chain endpoint to the pool.
+    ///
+    /// Uses the endpoint's `rate_limit` and `timeout` when set, otherwise
+    /// falls back to the pool defaults.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the endpoint URL is invalid.
+    pub fn add_endpoint(&self, endpoint: &ChainEndpoint) -> Result<(), RpcError> {
+        self.add_inner(
+            endpoint.chain,
+            &endpoint.url,
+            endpoint.rate_limit,
+            endpoint.timeout,
+        )
+    }
+
+    fn add_inner(
+        &self,
+        chain: NamedChain,
+        url: &str,
+        rate_limit: Option<u32>,
+        timeout: Option<Duration>,
+    ) -> Result<(), RpcError> {
+        let provider = create_pooled_provider(
+            url,
+            rate_limit.or(self.default_rate_limit),
+            timeout.or(self.default_timeout),
+        )?;
 
         let mut providers = self.providers.write().map_err(|_| {
             RpcError::ProviderConnectionFailed("Provider pool lock poisoned".to_string())
@@ -276,6 +325,8 @@ impl ProviderPool {
 pub struct ProviderPoolBuilder {
     endpoints: Vec<ChainEndpoint>,
     default_rate_limit: Option<u32>,
+    default_timeout: Option<Duration>,
+    rpc_policy_timeouts: HashMap<NamedChain, Duration>,
 }
 
 impl ProviderPoolBuilder {
@@ -288,11 +339,7 @@ impl ProviderPoolBuilder {
     /// Add a chain endpoint to the pool
     #[must_use]
     pub fn add_chain(mut self, chain: NamedChain, url: &str) -> Self {
-        self.endpoints.push(ChainEndpoint {
-            chain,
-            url: url.to_string(),
-            rate_limit: None,
-        });
+        self.endpoints.push(ChainEndpoint::new(chain, url));
         self
     }
 
@@ -304,11 +351,28 @@ impl ProviderPoolBuilder {
         url: &str,
         rate_limit: u32,
     ) -> Self {
-        self.endpoints.push(ChainEndpoint {
-            chain,
-            url: url.to_string(),
-            rate_limit: Some(rate_limit),
-        });
+        self.endpoints
+            .push(ChainEndpoint::new(chain, url).with_rate_limit(rate_limit));
+        self
+    }
+
+    /// Add a chain endpoint with a specific per-request timeout
+    #[must_use]
+    pub fn add_chain_with_timeout(
+        mut self,
+        chain: NamedChain,
+        url: &str,
+        timeout: Duration,
+    ) -> Self {
+        self.endpoints
+            .push(ChainEndpoint::new(chain, url).with_timeout(timeout));
+        self
+    }
+
+    /// Add a fully-specified [`ChainEndpoint`] to the pool
+    #[must_use]
+    pub fn add_endpoint(mut self, endpoint: ChainEndpoint) -> Self {
+        self.endpoints.push(endpoint);
         self
     }
 
@@ -319,6 +383,32 @@ impl ProviderPoolBuilder {
         self
     }
 
+    /// Set the default per-request timeout for all providers
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.default_timeout = Some(timeout);
+        self
+    }
+
+    /// Apply per-chain timeouts from an [`RpcPolicy`].
+    ///
+    /// The policy is evaluated for every endpoint that has already been
+    /// added to the builder; call this **after** all `add_chain*` /
+    /// `add_endpoint` calls for the timeout to take effect. Endpoints
+    /// added after this call do **not** pick up the policy timeout —
+    /// call `with_rpc_policy` again to refresh. A per-endpoint `timeout`
+    /// always wins; the builder's `default_timeout` is the fallback when
+    /// neither the endpoint nor the policy supplies one for a chain.
+    #[must_use]
+    pub fn with_rpc_policy<P: RpcPolicy>(mut self, policy: &P) -> Self {
+        for endpoint in &self.endpoints {
+            let cfg = policy.rpc_config(endpoint.chain);
+            self.rpc_policy_timeouts
+                .insert(endpoint.chain, cfg.rpc_timeout);
+        }
+        self
+    }
+
     /// Build the provider pool
     ///
     /// # Errors
@@ -326,21 +416,34 @@ impl ProviderPoolBuilder {
     /// Returns an error if any endpoint URL is invalid
     pub fn build(self) -> Result<ProviderPool, RpcError> {
         let pool = ProviderPool::with_defaults(self.default_rate_limit);
+        let pool = match self.default_timeout {
+            Some(t) => pool.with_default_timeout(t),
+            None => pool,
+        };
 
-        for endpoint in self.endpoints {
-            pool.add(
-                endpoint.chain,
-                &endpoint.url,
-                endpoint.rate_limit.or(self.default_rate_limit),
-            )?;
+        for endpoint in &self.endpoints {
+            let policy_timeout = self.rpc_policy_timeouts.get(&endpoint.chain).copied();
+            let effective = ChainEndpoint {
+                chain: endpoint.chain,
+                url: endpoint.url.clone(),
+                rate_limit: endpoint.rate_limit.or(self.default_rate_limit),
+                timeout: endpoint.timeout.or(policy_timeout),
+            };
+            pool.add_endpoint(&effective)?;
         }
 
         Ok(pool)
     }
 }
 
-/// Configuration for a chain endpoint
+/// Configuration for a chain endpoint.
+///
+/// Construct via [`ChainEndpoint::new`] (or one of the preset constructors
+/// such as [`ChainEndpoint::mainnet`]) and the `with_*` setters. The struct
+/// is `#[non_exhaustive]` so additional optional fields can be added in
+/// future releases without forcing struct-literal callers to update.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ChainEndpoint {
     /// The chain this endpoint serves
     pub chain: NamedChain,
@@ -348,6 +451,9 @@ pub struct ChainEndpoint {
     pub url: String,
     /// Optional rate limit override for this specific chain
     pub rate_limit: Option<u32>,
+    /// Optional per-request timeout override for this specific chain.
+    /// When `None`, the pool's default timeout (if any) is used.
+    pub timeout: Option<Duration>,
 }
 
 impl ChainEndpoint {
@@ -358,6 +464,7 @@ impl ChainEndpoint {
             chain,
             url: url.into(),
             rate_limit: None,
+            timeout: None,
         }
     }
 
@@ -365,6 +472,13 @@ impl ChainEndpoint {
     #[must_use]
     pub fn with_rate_limit(mut self, rate_limit: u32) -> Self {
         self.rate_limit = Some(rate_limit);
+        self
+    }
+
+    /// Override the per-request timeout for this chain
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
         self
     }
 
@@ -415,18 +529,23 @@ impl ChainEndpoint {
 fn create_pooled_provider(
     url: &str,
     rate_limit: Option<u32>,
+    timeout: Option<Duration>,
 ) -> Result<RootProvider<AnyNetwork>, RpcError> {
     let parsed_url: url::Url = url.parse().map_err(|e| {
         warn!(url = url, error = ?e, "Invalid provider URL");
         RpcError::ProviderUrlInvalid(url.to_string())
     })?;
 
-    // Build the RPC client with optional rate limiting
-    let client = match rate_limit {
-        Some(limit) => alloy_rpc_client::ClientBuilder::default()
-            .layer(RateLimitLayer::per_second(limit))
-            .http(parsed_url),
-        None => alloy_rpc_client::ClientBuilder::default().http(parsed_url),
+    let builder = rate_limit.map(|limit| {
+        alloy_rpc_client::ClientBuilder::default().layer(RateLimitLayer::per_second(limit))
+    });
+
+    let client = match (builder, timeout) {
+        (Some(b), Some(t)) => b.http_with_client(reqwest_client_with_timeout(t)?, parsed_url),
+        (Some(b), None) => b.http(parsed_url),
+        (None, Some(t)) => alloy_rpc_client::ClientBuilder::default()
+            .http_with_client(reqwest_client_with_timeout(t)?, parsed_url),
+        (None, None) => alloy_rpc_client::ClientBuilder::default().http(parsed_url),
     };
 
     // Create a bare provider without fillers - fillers are application-specific
@@ -526,5 +645,41 @@ mod tests {
         let pool = ProviderPool::new();
         let result = pool.add(NamedChain::Mainnet, "not a valid url", None);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn with_rpc_policy_only_covers_chains_added_before_it() {
+        use crate::config::policy::RpcConfig;
+
+        struct FixedTimeout(Duration);
+        impl RpcPolicy for FixedTimeout {
+            fn rpc_config(&self, _: NamedChain) -> RpcConfig {
+                RpcConfig {
+                    rpc_timeout: self.0,
+                }
+            }
+        }
+
+        let policy = FixedTimeout(Duration::from_secs(5));
+
+        let before = ProviderPoolBuilder::new()
+            .add_chain(NamedChain::Mainnet, "http://localhost:8545")
+            .with_rpc_policy(&policy);
+        assert_eq!(
+            before
+                .rpc_policy_timeouts
+                .get(&NamedChain::Mainnet)
+                .copied(),
+            Some(Duration::from_secs(5)),
+            "policy must apply when chain is added before with_rpc_policy",
+        );
+
+        let after = ProviderPoolBuilder::new()
+            .with_rpc_policy(&policy)
+            .add_chain(NamedChain::Mainnet, "http://localhost:8545");
+        assert!(
+            !after.rpc_policy_timeouts.contains_key(&NamedChain::Mainnet),
+            "policy must not apply when chain is added after with_rpc_policy",
+        );
     }
 }
