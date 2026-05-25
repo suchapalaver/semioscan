@@ -27,6 +27,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `create_typed_http_provider` now honours
+  `ProviderConfig::with_min_delay`. Previously the typed factory branched
+  only on `rate_limit_per_second` and silently dropped `min_delay`, so a
+  caller building a generic-network-typed provider (`Ethereum`,
+  `Optimism`, etc.) with only the minimum-delay knob set received an
+  unrate-limited provider — requests fired back-to-back and strict
+  upstreams returned 429s with no signal that the configured pacing had
+  been ignored. Both HTTP factories now route through a shared client
+  builder so the `(rate_limit_per_second, min_delay, timeout)` dispatch
+  matrix can't drift between them. When both `rate_limit_per_second`
+  and `min_delay` are set the rate-limit axis still wins, but the typed
+  factory now also emits the existing `tracing::warn!` so the conflict
+  is visible regardless of which factory the caller picked. Closes #45.
 - `fetch_logs_chunked` tracing events no longer tag every chunk with
   `chain = mainnet`. After the consolidation onto `LogScanner` in #33,
   the helper supplied `NamedChain::Mainnet` as a sentinel chain key, so

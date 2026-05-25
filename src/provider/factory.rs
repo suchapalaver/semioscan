@@ -19,8 +19,11 @@ use super::AnyHttpProvider;
 ///
 /// Centralizing the `(rate_limit_per_second, min_delay, timeout)` dispatch keeps
 /// the type-erased and typed factories from drifting out of sync — every HTTP
-/// provider this crate hands out flows through the same matrix.
-fn build_http_client(config: ProviderConfig) -> Result<RpcClient, RpcError> {
+/// provider this crate hands out flows through the same matrix. Exposed to
+/// the rest of the `provider` module so sibling builders (e.g. the pool
+/// factory in #47) can route through the same dispatch instead of growing a
+/// parallel matrix of their own.
+pub(super) fn build_http_client(config: ProviderConfig) -> Result<RpcClient, RpcError> {
     let url: url::Url = config
         .url
         .parse()
@@ -182,14 +185,32 @@ pub async fn create_ws_provider(
 ///
 /// - `N`: The network type (e.g., `Ethereum`, `Optimism`, `AnyNetwork`)
 ///
+/// # Configuration Options
+///
+/// Honors every field on [`ProviderConfig`] the type-erased
+/// [`create_http_provider`] does:
+///
+/// - `rate_limit_per_second` — installs a token-bucket layer that throttles
+///   requests to the configured rate.
+/// - `min_delay` — installs a minimum-delay layer that guarantees at least
+///   the configured gap between consecutive requests; useful for strict
+///   upstreams that prefer pacing over bursts.
+/// - `timeout` — applied at the HTTP transport (reqwest) layer.
+///
+/// If both `rate_limit_per_second` and `min_delay` are set, the rate-limit
+/// axis wins and a `tracing::warn!` is emitted so the operator can spot the
+/// conflicting configuration.
+///
 /// # Examples
 ///
 /// ```rust,ignore
 /// use alloy_network::Ethereum;
 /// use semioscan::provider::{create_typed_http_provider, ProviderConfig};
+/// use std::time::Duration;
 ///
 /// let provider = create_typed_http_provider::<Ethereum>(
 ///     ProviderConfig::new("https://eth.llamarpc.com")
+///         .with_min_delay(Duration::from_millis(250))
 /// )?;
 /// ```
 pub fn create_typed_http_provider<N>(
