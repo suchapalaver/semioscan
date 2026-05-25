@@ -68,7 +68,10 @@ pub struct UsdValue(f64);
 
 impl std::hash::Hash for UsdValue {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.0.to_bits().hash(state);
+        // PartialEq on f64 treats +0.0 and -0.0 as equal, but their bit patterns
+        // differ. Canonicalize zero before hashing so the Hash/Eq contract holds.
+        let canonical = if self.0 == 0.0 { 0.0 } else { self.0 };
+        canonical.to_bits().hash(state);
     }
 }
 
@@ -328,5 +331,40 @@ mod tests {
     fn test_from_non_negative_const() {
         const HUNDRED: UsdValue = UsdValue::from_non_negative(100.0);
         assert_eq!(HUNDRED.as_f64(), 100.0);
+    }
+
+    #[test]
+    fn test_hash_eq_law_across_signed_zero() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        fn digest(value: UsdValue) -> u64 {
+            let mut hasher = DefaultHasher::new();
+            value.hash(&mut hasher);
+            hasher.finish()
+        }
+
+        let pos = UsdValue::from_non_negative(0.0);
+        let neg = UsdValue::from_non_negative(-0.0);
+        // PartialEq treats +0.0 == -0.0; the Hash/Eq contract requires the digests
+        // to agree. UsdValue does not implement Eq because f64 doesn't, so the
+        // law is asserted directly on hashes — downstream types that wrap
+        // UsdValue and derive Hash inherit this guarantee.
+        assert_eq!(pos, neg);
+        assert_eq!(digest(pos), digest(neg));
+
+        let canonical = digest(pos);
+        let zeros = [
+            neg,
+            UsdValue::from_non_negative(-0.0) + UsdValue::from_non_negative(-0.0),
+            UsdValue::try_new(-0.0).unwrap(),
+            serde_json::from_str::<UsdValue>("-0.0").unwrap(),
+            UsdValue::ZERO,
+            UsdValue::default(),
+        ];
+        for v in zeros {
+            assert_eq!(v, pos);
+            assert_eq!(digest(v), canonical);
+        }
     }
 }
