@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- `MaxBlockRange::chunk_range`, `MaxBlockRange::chunks_needed`, and the
+  `ChunkIterator` type are no longer part of the public API. They had
+  no in-crate caller after the chunked log path was consolidated onto
+  `LogScanner`, so they exposed dead surface area that diverged from
+  the scanner's actual iteration (the scanner's loop terminates
+  correctly when `end_block == u64::MAX`; the iterator did not).
+  Consumers that were slicing block ranges directly should fold the
+  arithmetic into their own loop (`current.saturating_add(chunk_size
+  - 1).min(end)` per chunk, advancing via `to_block.checked_add(1)`
+  so the loop breaks when the chunk ends at `u64::MAX`) or reach for
+  `LogScanner` / `fetch_logs_chunked` / `EventScanner` to fetch logs
+  in chunks. Closes #36.
+
 ### Fixed
 
 - `GasCache` and `PriceCache` no longer return an over-counted aggregate
