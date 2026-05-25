@@ -6,7 +6,7 @@
 
 use alloy_network::AnyNetwork;
 use alloy_provider::RootProvider;
-use alloy_rpc_client::ClientBuilder;
+use alloy_rpc_client::{ClientBuilder, RpcClient};
 
 use crate::errors::RpcError;
 use crate::transport::RateLimitLayer;
@@ -14,6 +14,66 @@ use crate::transport::RateLimitLayer;
 use super::config::ProviderConfig;
 use super::http_client::reqwest_client_with_timeout;
 use super::AnyHttpProvider;
+
+/// Build the configured `RpcClient` shared by every HTTP factory.
+///
+/// Centralizing the `(rate_limit_per_second, min_delay, timeout)` dispatch keeps
+/// the type-erased and typed factories from drifting out of sync — every HTTP
+/// provider this crate hands out flows through the same matrix.
+fn build_http_client(config: ProviderConfig) -> Result<RpcClient, RpcError> {
+    let url: url::Url = config
+        .url
+        .parse()
+        .map_err(|e| RpcError::ProviderUrlInvalid(format!("{e}")))?;
+
+    let builder = ClientBuilder::default();
+
+    let client = match (config.rate_limit_per_second, config.min_delay) {
+        // Both rate limit and min delay (prefer rate limit)
+        (Some(rps), Some(_)) => {
+            tracing::warn!(
+                "Both rate_limit_per_second and min_delay specified, using rate_limit_per_second"
+            );
+            let builder = builder.layer(RateLimitLayer::per_second(rps));
+            match config.timeout {
+                Some(timeout) => {
+                    builder.http_with_client(reqwest_client_with_timeout(timeout)?, url)
+                }
+                None => builder.http(url),
+            }
+        }
+
+        // Rate limit only
+        (Some(rps), None) => {
+            let builder = builder.layer(RateLimitLayer::per_second(rps));
+            match config.timeout {
+                Some(timeout) => {
+                    builder.http_with_client(reqwest_client_with_timeout(timeout)?, url)
+                }
+                None => builder.http(url),
+            }
+        }
+
+        // Min delay only
+        (None, Some(delay)) => {
+            let builder = builder.layer(RateLimitLayer::with_min_delay(delay));
+            match config.timeout {
+                Some(timeout) => {
+                    builder.http_with_client(reqwest_client_with_timeout(timeout)?, url)
+                }
+                None => builder.http(url),
+            }
+        }
+
+        // No rate-limiting layer
+        (None, None) => match config.timeout {
+            Some(timeout) => builder.http_with_client(reqwest_client_with_timeout(timeout)?, url),
+            None => builder.http(url),
+        },
+    };
+
+    Ok(client)
+}
 
 /// Create an HTTP provider with the given configuration
 ///
@@ -55,62 +115,7 @@ use super::AnyHttpProvider;
 /// - The URL is malformed
 /// - The URL cannot be parsed
 pub fn create_http_provider(config: ProviderConfig) -> Result<AnyHttpProvider, RpcError> {
-    let url: url::Url = config
-        .url
-        .parse()
-        .map_err(|e| RpcError::ProviderUrlInvalid(format!("{e}")))?;
-
-    let builder = ClientBuilder::default();
-
-    match (config.rate_limit_per_second, config.min_delay) {
-        // Rate limit
-        (Some(rps), None) => {
-            let builder = builder.layer(RateLimitLayer::per_second(rps));
-            let client = match config.timeout {
-                Some(timeout) => {
-                    builder.http_with_client(reqwest_client_with_timeout(timeout)?, url)
-                }
-                None => builder.http(url),
-            };
-            Ok(RootProvider::<AnyNetwork>::new(client))
-        }
-
-        // Min delay
-        (None, Some(delay)) => {
-            let builder = builder.layer(RateLimitLayer::with_min_delay(delay));
-            let client = match config.timeout {
-                Some(timeout) => {
-                    builder.http_with_client(reqwest_client_with_timeout(timeout)?, url)
-                }
-                None => builder.http(url),
-            };
-            Ok(RootProvider::<AnyNetwork>::new(client))
-        }
-
-        // No rate limiting layers
-        (None, None) => {
-            let client = match config.timeout {
-                Some(timeout) => {
-                    builder.http_with_client(reqwest_client_with_timeout(timeout)?, url)
-                }
-                None => builder.http(url),
-            };
-            Ok(RootProvider::<AnyNetwork>::new(client))
-        }
-
-        // Both rate limit and min delay (prefer rate limit)
-        (Some(rps), Some(_)) => {
-            tracing::warn!(
-                "Both rate_limit_per_second and min_delay specified, using rate_limit_per_second"
-            );
-            let config = ProviderConfig {
-                rate_limit_per_second: Some(rps),
-                min_delay: None,
-                ..config
-            };
-            create_http_provider(config)
-        }
-    }
+    Ok(RootProvider::<AnyNetwork>::new(build_http_client(config)?))
 }
 
 /// Create a WebSocket provider with the given configuration
@@ -193,30 +198,7 @@ pub fn create_typed_http_provider<N>(
 where
     N: alloy_network::Network,
 {
-    let url: url::Url = config
-        .url
-        .parse()
-        .map_err(|e| RpcError::ProviderUrlInvalid(format!("{e}")))?;
-
-    let builder = ClientBuilder::default();
-
-    let client = match config.rate_limit_per_second {
-        Some(rps) => {
-            let builder = builder.layer(RateLimitLayer::per_second(rps));
-            match config.timeout {
-                Some(timeout) => {
-                    builder.http_with_client(reqwest_client_with_timeout(timeout)?, url)
-                }
-                None => builder.http(url),
-            }
-        }
-        None => match config.timeout {
-            Some(timeout) => builder.http_with_client(reqwest_client_with_timeout(timeout)?, url),
-            None => builder.http(url),
-        },
-    };
-
-    Ok(RootProvider::<N>::new(client))
+    Ok(RootProvider::<N>::new(build_http_client(config)?))
 }
 
 /// Quick helper to create a simple HTTP provider without configuration
@@ -287,5 +269,60 @@ mod tests {
         let result =
             create_typed_http_provider::<Ethereum>(ProviderConfig::new("http://localhost:8545"));
         assert!(result.is_ok());
+    }
+
+    /// Build-time acceptance check for every `(rate_limit_per_second, min_delay)`
+    /// combination on the typed factory. This does NOT by itself prove the
+    /// matching rate-limit layer is installed — the pre-#45 buggy code also
+    /// returned `Ok` for `(None, Some(delay))` while silently dropping the
+    /// `min_delay`. The behavioural contract is covered by the
+    /// `typed_provider_min_delay_test` integration test; this test's job is
+    /// to keep the dispatch surface from shrinking back to the buggy shape.
+    #[test]
+    fn typed_http_provider_accepts_full_dispatch_matrix() {
+        use alloy_network::Ethereum;
+        use std::time::Duration;
+
+        let url = "http://localhost:8545";
+
+        create_typed_http_provider::<Ethereum>(ProviderConfig::new(url)).expect("no rate limiting");
+
+        create_typed_http_provider::<Ethereum>(ProviderConfig::new(url).with_rate_limit(10))
+            .expect("rate_limit_per_second");
+
+        create_typed_http_provider::<Ethereum>(
+            ProviderConfig::new(url).with_min_delay(Duration::from_millis(250)),
+        )
+        .expect("min_delay only");
+
+        create_typed_http_provider::<Ethereum>(
+            ProviderConfig::new(url)
+                .with_rate_limit(5)
+                .with_min_delay(Duration::from_millis(250)),
+        )
+        .expect("both axes");
+    }
+
+    /// Build-time acceptance check against the shared builder directly, so
+    /// the dispatch matrix stays exercised even if the public wrappers change
+    /// shape. See `typed_http_provider_accepts_full_dispatch_matrix` for the
+    /// limits of this kind of check and pointers to the behavioural test.
+    #[test]
+    fn shared_builder_accepts_full_dispatch_matrix() {
+        use std::time::Duration;
+
+        let url = "http://localhost:8545";
+
+        build_http_client(ProviderConfig::new(url)).expect("no rate limiting");
+        build_http_client(ProviderConfig::new(url).with_rate_limit(10))
+            .expect("rate_limit_per_second");
+        build_http_client(ProviderConfig::new(url).with_min_delay(Duration::from_millis(250)))
+            .expect("min_delay only");
+        build_http_client(
+            ProviderConfig::new(url)
+                .with_rate_limit(5)
+                .with_min_delay(Duration::from_millis(250)),
+        )
+        .expect("both axes");
     }
 }
