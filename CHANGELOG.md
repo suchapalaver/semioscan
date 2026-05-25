@@ -58,6 +58,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as the type-erased and typed factories, so a `(rate_limit_per_second,
   min_delay, timeout)` configuration is dispatched identically wherever
   a provider is built. Closes #47.
+- `create_ws_provider` now honours `ProviderConfig::with_min_delay`.
+  Previously the WebSocket factory branched only on
+  `rate_limit_per_second` and silently dropped `min_delay`, so a caller
+  spacing WebSocket RPC calls against a strict upstream — e.g. batched
+  `eth_call` or poll-style `eth_getLogs` fallbacks over the WS
+  transport — received an unpaced provider, with requests firing
+  back-to-back and the upstream returning 429s with no signal that the
+  configured pacing had been ignored. The WebSocket and HTTP factories
+  now share the `(rate_limit_per_second, min_delay)` dispatch helper,
+  so when both axes are set the rate-limit axis still wins and the
+  existing `tracing::warn!` fires regardless of which transport the
+  caller picked. `ProviderConfig::timeout` is still not applied to
+  WebSocket connections — `alloy_provider::WsConnect` does not expose a
+  per-request timeout knob — but the factory now logs a
+  `tracing::warn!` at construction when a timeout is set on a config
+  handed to the WebSocket factory, so operators reusing an HTTP-shaped
+  `ProviderConfig` see the dropped axis instead of silently inheriting
+  HTTP defaults' behaviour. Closes #46.
 - `create_typed_http_provider` now honours
   `ProviderConfig::with_min_delay`. Previously the typed factory branched
   only on `rate_limit_per_second` and silently dropped `min_delay`, so a
