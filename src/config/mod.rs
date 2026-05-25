@@ -539,6 +539,14 @@ impl policy::LookupPolicy for SemioscanConfig {
     }
 }
 
+impl policy::RpcPolicy for SemioscanConfig {
+    fn rpc_config(&self, chain: NamedChain) -> policy::RpcConfig {
+        policy::RpcConfig {
+            rpc_timeout: self.get_rpc_timeout(chain),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

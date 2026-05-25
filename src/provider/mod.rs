@@ -73,6 +73,7 @@
 
 mod config;
 mod factory;
+mod http_client;
 mod pool;
 
 pub use config::ProviderConfig;
@@ -286,7 +287,7 @@ impl DynProviderBuilder {
         url: &str,
         chain: NamedChain,
     ) -> Result<ChainAwareProvider<AnyHttpProvider>, crate::errors::RpcError> {
-        let config = ProviderConfig::new(url).with_rate_limit_opt(self.rate_limit_per_second);
+        let config = self.provider_config(url);
 
         let provider = create_http_provider(config)?;
         Ok(ChainAwareProvider::new(provider, chain))
@@ -298,9 +299,15 @@ impl DynProviderBuilder {
     ///
     /// Returns an error if the URL is invalid
     pub fn build_http(self, url: &str) -> Result<AnyHttpProvider, crate::errors::RpcError> {
-        let config = ProviderConfig::new(url).with_rate_limit_opt(self.rate_limit_per_second);
+        create_http_provider(self.provider_config(url))
+    }
 
-        create_http_provider(config)
+    fn provider_config(&self, url: &str) -> ProviderConfig {
+        let mut config = ProviderConfig::new(url).with_rate_limit_opt(self.rate_limit_per_second);
+        if let Some(ms) = self.timeout_ms {
+            config = config.with_timeout(std::time::Duration::from_millis(ms));
+        }
+        config
     }
 }
 

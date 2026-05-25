@@ -12,6 +12,7 @@ use crate::errors::RpcError;
 use crate::transport::RateLimitLayer;
 
 use super::config::ProviderConfig;
+use super::http_client::reqwest_client_with_timeout;
 use super::AnyHttpProvider;
 
 /// Create an HTTP provider with the given configuration
@@ -59,27 +60,43 @@ pub fn create_http_provider(config: ProviderConfig) -> Result<AnyHttpProvider, R
         .parse()
         .map_err(|e| RpcError::ProviderUrlInvalid(format!("{e}")))?;
 
+    let builder = ClientBuilder::default();
+
     match (config.rate_limit_per_second, config.min_delay) {
         // Rate limit
         (Some(rps), None) => {
-            let client = ClientBuilder::default()
-                .layer(RateLimitLayer::per_second(rps))
-                .http(url);
-
+            let builder = builder.layer(RateLimitLayer::per_second(rps));
+            let client = match config.timeout {
+                Some(timeout) => {
+                    builder.http_with_client(reqwest_client_with_timeout(timeout)?, url)
+                }
+                None => builder.http(url),
+            };
             Ok(RootProvider::<AnyNetwork>::new(client))
         }
 
         // Min delay
         (None, Some(delay)) => {
-            let client = ClientBuilder::default()
-                .layer(RateLimitLayer::with_min_delay(delay))
-                .http(url);
-
+            let builder = builder.layer(RateLimitLayer::with_min_delay(delay));
+            let client = match config.timeout {
+                Some(timeout) => {
+                    builder.http_with_client(reqwest_client_with_timeout(timeout)?, url)
+                }
+                None => builder.http(url),
+            };
             Ok(RootProvider::<AnyNetwork>::new(client))
         }
 
-        // No layers
-        (None, None) => Ok(RootProvider::<AnyNetwork>::new_http(url)),
+        // No rate limiting layers
+        (None, None) => {
+            let client = match config.timeout {
+                Some(timeout) => {
+                    builder.http_with_client(reqwest_client_with_timeout(timeout)?, url)
+                }
+                None => builder.http(url),
+            };
+            Ok(RootProvider::<AnyNetwork>::new(client))
+        }
 
         // Both rate limit and min delay (prefer rate limit)
         (Some(rps), Some(_)) => {
@@ -181,17 +198,25 @@ where
         .parse()
         .map_err(|e| RpcError::ProviderUrlInvalid(format!("{e}")))?;
 
-    match config.rate_limit_per_second {
+    let builder = ClientBuilder::default();
+
+    let client = match config.rate_limit_per_second {
         Some(rps) => {
-            let client = ClientBuilder::default()
-                .layer(RateLimitLayer::per_second(rps))
-                .http(url);
-
-            Ok(RootProvider::<N>::new(client))
+            let builder = builder.layer(RateLimitLayer::per_second(rps));
+            match config.timeout {
+                Some(timeout) => {
+                    builder.http_with_client(reqwest_client_with_timeout(timeout)?, url)
+                }
+                None => builder.http(url),
+            }
         }
+        None => match config.timeout {
+            Some(timeout) => builder.http_with_client(reqwest_client_with_timeout(timeout)?, url),
+            None => builder.http(url),
+        },
+    };
 
-        None => Ok(RootProvider::<N>::new_http(url)),
-    }
+    Ok(RootProvider::<N>::new(client))
 }
 
 /// Quick helper to create a simple HTTP provider without configuration

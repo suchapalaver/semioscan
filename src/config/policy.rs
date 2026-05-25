@@ -15,12 +15,15 @@
 //! - [`LookupConfig`] / [`LookupPolicy`] — what serial transaction/receipt
 //!   retries read: the maximum number of fallback attempts per failed
 //!   lookup.
+//! - [`RpcConfig`] / [`RpcPolicy`] — what provider construction reads:
+//!   the per-request timeout to apply to the underlying HTTP transport.
 //!
-//! [`SemioscanConfig`](crate::SemioscanConfig) implements both traits, so
+//! [`SemioscanConfig`](crate::SemioscanConfig) implements all three traits, so
 //! existing call sites that pass it through unchanged keep working. Internal
-//! consumers (`LogScanner`, `CombinedCalculator`, `GasCostCalculator`) reach
-//! into the narrower view rather than the full aggregate, making each
-//! module's actual configuration dependency visible at the call site.
+//! consumers (`LogScanner`, `CombinedCalculator`, `GasCostCalculator`,
+//! `ProviderPoolBuilder`) reach into the narrower view rather than the full
+//! aggregate, making each module's actual configuration dependency visible at
+//! the call site.
 
 use std::time::Duration;
 
@@ -51,6 +54,19 @@ pub struct LookupConfig {
     pub serial_lookup_fallback_attempts: usize,
 }
 
+/// Per-chain settings consumed by provider construction.
+///
+/// Provider factories (`create_http_provider`, `ProviderPoolBuilder`) apply
+/// `rpc_timeout` to the underlying HTTP transport so a single hung request
+/// cannot block a calling task indefinitely. Other RPC concerns (rate
+/// limiting, chunk sizes) live in [`ScanConfig`] and on
+/// [`ProviderConfig`](crate::provider::ProviderConfig) itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RpcConfig {
+    /// Per-request timeout for RPC calls.
+    pub rpc_timeout: Duration,
+}
+
 /// Resolves a [`ScanConfig`] for a given chain.
 ///
 /// Implemented by [`SemioscanConfig`](crate::SemioscanConfig); custom
@@ -67,6 +83,16 @@ pub trait ScanPolicy {
 pub trait LookupPolicy {
     /// Effective lookup settings for `chain`.
     fn lookup_config(&self, chain: NamedChain) -> LookupConfig;
+}
+
+/// Resolves an [`RpcConfig`] for a given chain.
+///
+/// Implemented by [`SemioscanConfig`](crate::SemioscanConfig); custom
+/// implementations let callers feed the provider construction path their own
+/// timeout policy without depending on the full config surface.
+pub trait RpcPolicy {
+    /// Effective RPC settings for `chain`.
+    fn rpc_config(&self, chain: NamedChain) -> RpcConfig;
 }
 
 #[cfg(test)]
@@ -127,6 +153,36 @@ mod tests {
                 .lookup_config(NamedChain::Mainnet)
                 .serial_lookup_fallback_attempts,
             1
+        );
+    }
+
+    #[test]
+    fn semioscan_config_rpc_view_returns_global_timeout_by_default() {
+        let config = SemioscanConfig::default();
+        assert_eq!(
+            config.rpc_config(NamedChain::Mainnet).rpc_timeout,
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            config.rpc_config(NamedChain::Arbitrum).rpc_timeout,
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn semioscan_config_rpc_view_honors_chain_override() {
+        let config = SemioscanConfigBuilder::with_defaults()
+            .rpc_timeout(Duration::from_secs(45))
+            .chain_timeout(NamedChain::Polygon, Duration::from_secs(90))
+            .build();
+
+        assert_eq!(
+            config.rpc_config(NamedChain::Mainnet).rpc_timeout,
+            Duration::from_secs(45)
+        );
+        assert_eq!(
+            config.rpc_config(NamedChain::Polygon).rpc_timeout,
+            Duration::from_secs(90)
         );
     }
 }

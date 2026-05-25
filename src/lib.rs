@@ -52,7 +52,9 @@ pub use types::wei::WeiAmount;
 
 // === Configuration (from config/) ===
 pub use config::constants;
-pub use config::policy::{LookupConfig, LookupPolicy, ScanConfig, ScanPolicy};
+pub use config::policy::{
+    LookupConfig, LookupPolicy, RpcConfig, RpcPolicy, ScanConfig, ScanPolicy,
+};
 pub use config::{ChainConfig, SemioscanConfig, SemioscanConfigBuilder};
 
 // === Error Types (from errors/) ===
