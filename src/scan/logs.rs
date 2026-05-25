@@ -68,7 +68,9 @@ where
     /// chunk's `from_block`/`to_block`, then `eth_getLogs` is issued. Between
     /// chunks, `config.get_rate_limit_delay(chain)` is applied (when set).
     ///
-    /// On a per-chunk transport error, `on_chunk_error` is called:
+    /// On a per-chunk transport error, `on_chunk_error` is called with the
+    /// failing chunk's `from_block` and `to_block` so the caller can attribute
+    /// the failure to a concrete block window:
     /// - `None`  — log the error and continue with the next chunk.
     /// - `Some(err)` — abort the scan and return `Err(err)`.
     ///
@@ -92,7 +94,7 @@ where
         on_chunk_error: F,
     ) -> Result<Vec<Log>, E>
     where
-        F: FnMut(TransportError) -> Option<E>,
+        F: FnMut(BlockNumber, BlockNumber, TransportError) -> Option<E>,
     {
         let chunk_size = self.config.get_max_block_range(chain).as_u64();
         assert!(
@@ -136,7 +138,7 @@ where
         mut on_chunk_error: F,
     ) -> Result<Vec<Log>, E>
     where
-        F: FnMut(TransportError) -> Option<E>,
+        F: FnMut(BlockNumber, BlockNumber, TransportError) -> Option<E>,
     {
         assert!(chunk_size > 0, "chunk_size must be > 0");
 
@@ -187,7 +189,7 @@ where
                         %to_block,
                         "Error fetching logs in range"
                     );
-                    if let Some(mapped) = on_chunk_error(e) {
+                    if let Some(mapped) = on_chunk_error(current_block, to_block, e) {
                         return Err(mapped);
                     }
                 }
@@ -377,7 +379,7 @@ mod tests {
         let scanner = LogScanner::new(provider, config_with_chunk_size(100));
 
         let result = scanner
-            .scan::<&'static str, _>(NamedChain::Arbitrum, Filter::new(), 0, 199, |_| {
+            .scan::<&'static str, _>(NamedChain::Arbitrum, Filter::new(), 0, 199, |_, _, _| {
                 Some("failed")
             })
             .await;
@@ -409,7 +411,7 @@ mod tests {
                 Filter::new(),
                 0,
                 299,
-                |_| None,
+                |_, _, _| None,
             )
             .await
             .expect("continue policy never returns error");
@@ -432,7 +434,7 @@ mod tests {
                 Filter::new(),
                 10,
                 42,
-                |_| None,
+                |_, _, _| None,
             )
             .await
             .unwrap();
@@ -449,9 +451,13 @@ mod tests {
         let scanner = LogScanner::new(provider, config_with_chunk_size(100));
 
         scanner
-            .scan::<std::convert::Infallible, _>(NamedChain::Arbitrum, Filter::new(), 0, 99, |_| {
-                None
-            })
+            .scan::<std::convert::Infallible, _>(
+                NamedChain::Arbitrum,
+                Filter::new(),
+                0,
+                99,
+                |_, _, _| None,
+            )
             .await
             .unwrap();
 
@@ -474,7 +480,7 @@ mod tests {
                 Filter::new(),
                 0,
                 299,
-                |_| None,
+                |_, _, _| None,
             )
             .await
             .unwrap();
@@ -502,7 +508,7 @@ mod tests {
                 Filter::new(),
                 0,
                 199,
-                |_| None,
+                |_, _, _| None,
             )
             .await
             .unwrap();
@@ -530,9 +536,13 @@ mod tests {
 
         let started = Instant::now();
         scanner
-            .scan::<std::convert::Infallible, _>(NamedChain::Arbitrum, Filter::new(), 0, 50, |_| {
-                None
-            })
+            .scan::<std::convert::Infallible, _>(
+                NamedChain::Arbitrum,
+                Filter::new(),
+                0,
+                50,
+                |_, _, _| None,
+            )
             .await
             .unwrap();
         let elapsed = started.elapsed();
@@ -567,7 +577,7 @@ mod tests {
                 Filter::new(),
                 0,
                 u64::MAX,
-                |_| None,
+                |_, _, _| None,
             )
             .await
             .expect("scan must terminate even when end_block == u64::MAX");
@@ -591,7 +601,7 @@ mod tests {
                 Filter::new(),
                 0,
                 299,
-                |_| None,
+                |_, _, _| None,
             )
             .await
             .expect("continue policy must not surface chunk errors");
@@ -627,7 +637,7 @@ mod tests {
                 Filter::new(),
                 0,
                 199,
-                |_| None,
+                |_, _, _| None,
             )
             .await
             .unwrap();
@@ -655,10 +665,23 @@ mod tests {
         let provider = build_provider(transport.clone());
         let scanner = LogScanner::new(provider, config_with_chunk_size(100));
 
+        let observed_bounds = Arc::new(Mutex::new(Vec::<(BlockNumber, BlockNumber)>::new()));
+        let observed_bounds_clone = Arc::clone(&observed_bounds);
+
         let result = scanner
-            .scan::<&'static str, _>(NamedChain::Arbitrum, Filter::new(), 0, 299, |_| {
-                Some("aborted on second chunk")
-            })
+            .scan::<&'static str, _>(
+                NamedChain::Arbitrum,
+                Filter::new(),
+                0,
+                299,
+                |chunk_from, chunk_to, _| {
+                    observed_bounds_clone
+                        .lock()
+                        .expect("bounds lock")
+                        .push((chunk_from, chunk_to));
+                    Some("aborted on second chunk")
+                },
+            )
             .await;
 
         assert_eq!(result, Err("aborted on second chunk"));
@@ -666,6 +689,12 @@ mod tests {
             transport.call_count(),
             2,
             "fail-fast must not attempt chunks after the failure"
+        );
+        let bounds = observed_bounds.lock().expect("bounds lock").clone();
+        assert_eq!(
+            bounds,
+            vec![(100, 199)],
+            "closure must receive the failing chunk's bounds, not the outer scan range or a prior successful chunk"
         );
     }
 
@@ -706,9 +735,13 @@ mod tests {
         );
 
         let _ = scanner
-            .scan::<std::convert::Infallible, _>(NamedChain::Arbitrum, Filter::new(), 0, 10, |_| {
-                None
-            })
+            .scan::<std::convert::Infallible, _>(
+                NamedChain::Arbitrum,
+                Filter::new(),
+                0,
+                10,
+                |_, _, _| None,
+            )
             .await;
     }
 
@@ -808,7 +841,14 @@ mod tests {
             let scanner = LogScanner::new(provider, config_with_chunk_size(100));
 
             scanner
-                .scan_raw::<std::convert::Infallible, _>(100, None, Filter::new(), 0, 299, |_| None)
+                .scan_raw::<std::convert::Infallible, _>(
+                    100,
+                    None,
+                    Filter::new(),
+                    0,
+                    299,
+                    |_, _, _| None,
+                )
                 .await
                 .expect("scan_raw happy path");
         }
@@ -854,7 +894,7 @@ mod tests {
                     Filter::new(),
                     0,
                     50,
-                    |_| None,
+                    |_, _, _| None,
                 )
                 .await
                 .expect("scan happy path");

@@ -37,6 +37,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   callers of `LogScanner::scan` (gas, price, retrieval, `EventScanner`)
   keep their per-chain tracing — the chain field flows from a
   `log_scan` span attached around the scan future. Closes #35.
+- `fetch_logs_chunked` errors now name the failing chunk window again.
+  After the consolidation onto `LogScanner` in #33, a mid-stream chunk
+  failure surfaced as `Failed to fetch logs: <transport error>` with no
+  way to tell which chunk of a multi-thousand-block scan had failed —
+  forensics required manually deriving chunk N from the configured
+  chunk size and the outer window. The error now reads
+  `Failed to fetch logs for blocks <start>-<end>: <transport error>`,
+  matching the message shipped before #33. The same chunk window is
+  now also surfaced in the fail-fast errors from `GasCostCalculator`
+  and `CombinedCalculator`, which previously embedded the outer scan
+  range and so attributed every chunk failure to the full requested
+  span. Closes #34.
 - `GasCache` and `PriceCache` no longer return an over-counted aggregate
   when a query window is narrower than a cached entry. Before, a cache
   holding `[50, 350]` would answer a `[100, 300]` query with the wider

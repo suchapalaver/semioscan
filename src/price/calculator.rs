@@ -350,7 +350,9 @@ impl<P: Provider + Clone> PriceCalculator<P> {
         // Continue-on-error: missing a chunk reduces coverage but does not
         // fail the price calculation.
         let logs = scanner
-            .scan::<PriceCalculationError, _>(self.chain, filter, gap_start, gap_end, |_| None)
+            .scan::<PriceCalculationError, _>(self.chain, filter, gap_start, gap_end, |_, _, _| {
+                None
+            })
             .await?;
 
         info!(
@@ -593,7 +595,13 @@ impl<P: Provider + Clone> PriceCalculator<P> {
         // Continue-on-error: missing a chunk reduces coverage but does not
         // fail the raw-swap extraction.
         let logs = scanner
-            .scan::<PriceCalculationError, _>(self.chain, filter, start_block, end_block, |_| None)
+            .scan::<PriceCalculationError, _>(
+                self.chain,
+                filter,
+                start_block,
+                end_block,
+                |_, _, _| None,
+            )
             .await?;
 
         info!(

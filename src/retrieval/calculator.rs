@@ -556,10 +556,10 @@ where
                     filter_template,
                     from_block,
                     to_block,
-                    |e| {
+                    |chunk_from, chunk_to, e| {
                         Some(RetrievalError::Rpc(crate::errors::RpcError::get_logs_failed(
                             format!(
-                                "get_logs for blocks {from_block}-{to_block} on {chain:?}"
+                                "get_logs for blocks {chunk_from}-{chunk_to} on {chain:?}"
                             ),
                             e,
                         )))

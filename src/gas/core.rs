@@ -263,12 +263,18 @@ where
             let scanner = LogScanner::new(&self.provider, self.config.clone());
             let event_name = event_type.name();
             let logs = scanner
-                .scan::<GasCalculationError, _>(chain, filter_template, from_block, to_block, |e| {
-                    Some(GasCalculationError::from(RpcError::get_logs_failed(
-                        format!("{event_name} events from block {from_block} to {to_block}"),
-                        e,
-                    )))
-                })
+                .scan::<GasCalculationError, _>(
+                    chain,
+                    filter_template,
+                    from_block,
+                    to_block,
+                    |chunk_from, chunk_to, e| {
+                        Some(GasCalculationError::from(RpcError::get_logs_failed(
+                            format!("{event_name} events from block {chunk_from} to {chunk_to}"),
+                            e,
+                        )))
+                    },
+                )
                 .await?;
 
             for log in &logs {
