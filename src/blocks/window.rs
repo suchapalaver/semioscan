@@ -174,15 +174,10 @@ pub struct BlockWindowCalculator<P> {
     provider: P,
     cache: Box<dyn BlockWindowCache>,
     bounds_memo: ChainBoundsMemo,
-    /// When `true`, [`Self::get_daily_window`] routes head fetches through
-    /// [`ChainBoundsMemo::get_or_fetch_head`] (full `(block, ts)` pair)
-    /// rather than [`ChainBoundsMemo::get_or_fetch_latest_block`] (block
-    /// number only). [`Self::with_disk_cache`] sets this so the
-    /// cold-memo daily-window path can confirm a day is fully
-    /// historical and actually persist the result to disk — without
-    /// `latest_ts` the conservative skip-insert branch always fires and
-    /// the disk cache file stays empty for daily-window-only callers.
-    /// See [`Self::with_disk_cache`]'s rustdoc and #18.
+    /// When `true`, [`Self::get_daily_window`] fetches the chain head's
+    /// timestamp alongside its block number so cold-memo calls can
+    /// persist historical days. Set by [`Self::with_disk_cache`]; see
+    /// that constructor's "Behavior" section and #18.
     eager_head_ts: bool,
 }
 
@@ -432,26 +427,31 @@ impl<P: Provider> BlockWindowCalculator<P> {
     ///
     /// # Behavior
     ///
-    /// This constructor opts into the **eager head-timestamp fetch** for
-    /// [`Self::get_daily_window`]: the calculator fetches the chain
-    /// head's full `(block, timestamp)` pair on the cold-memo path
-    /// instead of just the block number. Without the head's timestamp,
-    /// [`Self::get_daily_window`] cannot distinguish a fully-historical
-    /// day from one whose head sits inside the requested day, and
-    /// conservatively skips the cache insert — so a daily-window-only
-    /// consumer paired with [`Self::with_memory_cache`]-style internals
-    /// would see an empty disk cache file across restarts. The disk
-    /// cache backend exists specifically to amortize binary searches
-    /// across process restarts, so this constructor accepts the cost of
-    /// one extra `eth_getBlockByNumber(head)` per head-TTL window per
-    /// chain to keep that promise. The same memo is shared with
-    /// [`Self::block_range_for_timestamps`], so mixed workloads pay the
-    /// fetch only once per TTL regardless of which method triggered it.
+    /// Calculators built through this constructor write `(chain, date)`
+    /// windows to the cache file as soon as the day is fully in the
+    /// past, so a process restart picks up where the previous one left
+    /// off without re-running any binary searches. To make this
+    /// possible, the first call to [`Self::get_daily_window`] or
+    /// [`Self::block_range_for_timestamps`] per chain (per the
+    /// configurable head TTL — default 30 seconds, see
+    /// [`Self::with_head_ttl`]) fetches the chain head's block in
+    /// addition to its number: one additional RPC call compared to
+    /// [`Self::with_memory_cache`]. Mixed workloads share that fetch
+    /// across both methods.
     ///
-    /// Consumers that need disk-style persistence but want to avoid the
-    /// eager head fetch can construct via [`Self::new`] with a hand-rolled
-    /// [`DiskCache`]; that path preserves the conservative default. See
-    /// #18 for the failure scenario this constructor's behavior addresses.
+    /// ## Trade-off: transient tip failures
+    ///
+    /// A one-block reorg orphaning the just-reported head between the
+    /// two RPC calls, or a free-tier provider's cache lag, can surface
+    /// as a [`BlockWindowError::Rpc`] containing
+    /// [`RpcError::BlockNotFound`] from [`Self::get_daily_window`] —
+    /// even when the requested date is fully historical. This is the
+    /// failure mode that 0.14.0 removed for daily-window callers
+    /// (#11). Callers that need persistence across restarts but cannot
+    /// tolerate this failure can build a [`DiskCache`] by hand and
+    /// pass it through [`Self::new`]; that path keeps 0.14.0's
+    /// behavior. See #18 for the failure scenario this constructor's
+    /// default behavior addresses.
     ///
     /// # Examples
     ///
@@ -682,9 +682,9 @@ impl<P: Provider> BlockWindowCalculator<P> {
     ///    best-effort window is still returned to the caller; only the
     ///    cache insert is skipped, at a cost of one extra binary
     ///    search on a subsequent cold restart for the same date.
-    ///    Calculators constructed via [`Self::with_disk_cache`] avoid
-    ///    this case by fetching the head's full `(block, ts)` pair
-    ///    eagerly — see that constructor's "Behavior" section.
+    ///    Calculators built via [`Self::with_disk_cache`] avoid this
+    ///    case at the cost of one additional RPC call per chain per
+    ///    head TTL — see that constructor's "Behavior" section.
     ///
     /// # Arguments
     /// * `chain` - The named chain for which to calculate the block window
@@ -965,39 +965,36 @@ where
 /// [`ChainBoundsMemo`], binary search, and cache insertion — can be exercised
 /// in tests without a live RPC.
 ///
-/// `eager_head_ts` selects the head-fetch shape:
+/// `eager_head_ts` selects how the chain head is fetched:
 ///
-/// - `false` (the default for calculators constructed via
-///   [`BlockWindowCalculator::with_memory_cache`], [`BlockWindowCalculator::without_cache`],
-///   and [`BlockWindowCalculator::new`]): the chain head's block number is
-///   routed through [`ChainBoundsMemo::get_or_fetch_latest_block`] — the
-///   thinner sibling of [`ChainBoundsMemo::get_or_fetch_head`] that fetches
-///   only the block number. The binary search needs the block number to
-///   bound its probes but never the head's timestamp, so the daily-window
-///   path doesn't pay the `eth_getBlockByNumber(head)` round-trip nor
-///   inherit its transient failure modes (one-block tip reorgs, free-tier
-///   provider cache lag). The trade-off: cold-memo calls cannot confirm
-///   the requested day is fully historical and conservatively skip the
-///   cache insert — see "Cold memo" in
-///   [`BlockWindowCalculator::get_daily_window`]'s rustdoc.
-/// - `true` (the default for calculators constructed via
-///   [`BlockWindowCalculator::with_disk_cache`]): the chain head's full
-///   `(block, ts)` pair is fetched via
-///   [`ChainBoundsMemo::get_or_fetch_head`] so cold-memo calls have
-///   `latest_ts` in hand and can confirm historical days are safe to
-///   persist. Re-introduces the transient-tip failure surface that the
-///   `false` path was designed to avoid, but a persistent cache that
-///   never persists is worse than retrying a transient failure — see
-///   #18 and [`BlockWindowCalculator::with_disk_cache`]'s rustdoc.
+/// - `false`: fetches only the head's block number. The binary search
+///   needs the block number to bound its probes but never the head's
+///   timestamp, so this path saves one RPC call and avoids the
+///   transient failure modes that fetching the head's block exposes
+///   (one-block reorgs, free-tier provider cache lag). The cost is
+///   that without the head's timestamp, calls on a cold memo cannot
+///   confirm the requested day is fully historical and skip the cache
+///   insert — see the "Cold memo" case in
+///   [`BlockWindowCalculator::get_daily_window`]'s rustdoc. Used by
+///   calculators built via [`BlockWindowCalculator::with_memory_cache`],
+///   [`BlockWindowCalculator::without_cache`], and
+///   [`BlockWindowCalculator::new`].
 ///
-/// Storage is shared with [`ChainBoundsMemo::get_or_fetch_head`]: a head
-/// populated here is reused by subsequent
-/// [`BlockWindowCalculator::get_daily_window`] calls within the TTL.
-/// [`BlockWindowCalculator::block_range_for_timestamps`] treats a partial
-/// entry left by the `false` path as a miss and refetches the full
-/// `(block, ts)` pair — the closure it supplies to
-/// [`ChainBoundsMemo::get_or_fetch_head`] fetches both, so the partial
-/// block number is discarded rather than upgraded in place.
+/// - `true`: fetches the head's full `(block, timestamp)` pair so
+///   cold-memo calls have the timestamp in hand and can persist
+///   historical days. Re-introduces the transient-tip failure surface
+///   the `false` path avoids — see
+///   [`BlockWindowCalculator::with_disk_cache`]'s rustdoc for the
+///   trade-off and #18 for the failure scenario it addresses. Used
+///   by calculators built via [`BlockWindowCalculator::with_disk_cache`].
+///
+/// Both branches share the same head memo: a head fetched here is
+/// reused across subsequent [`BlockWindowCalculator::get_daily_window`]
+/// and [`BlockWindowCalculator::block_range_for_timestamps`] calls
+/// within the TTL. A partial entry left by the `false` branch (block
+/// number only) is discarded — not upgraded — when
+/// [`BlockWindowCalculator::block_range_for_timestamps`] later needs
+/// the timestamp.
 ///
 /// # Tip-adjacent and past-tip dates
 ///
