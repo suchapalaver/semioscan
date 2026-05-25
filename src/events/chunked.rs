@@ -39,13 +39,12 @@
 //! # }
 //! ```
 
-use alloy_chains::NamedChain;
 use alloy_provider::Provider;
 use alloy_rpc_types::{Filter, Log};
 
 use crate::errors::EventProcessingError;
 use crate::scan::LogScanner;
-use crate::SemioscanConfigBuilder;
+use crate::SemioscanConfig;
 
 /// Fetch logs in chunks to handle large block ranges.
 ///
@@ -122,21 +121,15 @@ pub async fn fetch_logs_chunked<P: Provider>(
         .get_to_block()
         .ok_or_else(|| EventProcessingError::invalid_input("Filter must have to_block set"))?;
 
-    // `LogScanner` reads its chunk size and (optional) rate-limit delay from
-    // `SemioscanConfig` keyed by chain. `fetch_logs_chunked` is chain-agnostic,
-    // so build a one-off config that pins the caller-supplied chunk size to a
-    // sentinel chain and leaves rate limiting disabled. `SemioscanConfigBuilder::new`
-    // starts from `SemioscanConfig::minimal` — no rate-limit delay and no chain
-    // overrides — so the sentinel inherits "no delay" without explicit clearing.
-    const SENTINEL_CHAIN: NamedChain = NamedChain::Mainnet;
-    let config = SemioscanConfigBuilder::new()
-        .chain_max_blocks(SENTINEL_CHAIN, chunk_size)
-        .build();
-
-    let scanner = LogScanner::new(provider, config);
+    // `fetch_logs_chunked` is chain-agnostic: it carries no chain context, so
+    // it uses `LogScanner::scan_raw` to pass `chunk_size` directly and skip
+    // both the chain-keyed config lookup and the `chain` tracing field. The
+    // config is only here to satisfy `LogScanner::new`; `scan_raw` doesn't
+    // read chunk size or rate limit from it.
+    let scanner = LogScanner::new(provider, SemioscanConfig::minimal());
 
     scanner
-        .scan(SENTINEL_CHAIN, filter, start_block, end_block, |e| {
+        .scan_raw(chunk_size, None, filter, start_block, end_block, |e| {
             Some(EventProcessingError::rpc_failed(format!(
                 "Failed to fetch logs: {e}"
             )))
@@ -404,6 +397,125 @@ mod tests {
             transport.calls(),
             2,
             "third chunk must not be attempted after the second fails"
+        );
+    }
+
+    /// JSON-line tracing capture for asserting on event fields. Mirrors the
+    /// helper in `src/scan/logs.rs::tests`; lifted here so `fetch_logs_chunked`
+    /// can be exercised without a live RPC.
+    #[derive(Clone, Default)]
+    struct CapturingWriter {
+        buf: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl CapturingWriter {
+        fn captured(&self) -> String {
+            String::from_utf8(self.buf.lock().expect("capture buffer lock").clone())
+                .expect("captured tracing output should be valid UTF-8")
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturingWriter {
+        type Writer = CapturingWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl std::io::Write for CapturingWriter {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.buf
+                .lock()
+                .expect("capture buffer lock")
+                .extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn install_subscriber(writer: CapturingWriter) -> tracing::subscriber::DefaultGuard {
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(writer)
+            .with_current_span(true)
+            .with_span_list(true)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        tracing::subscriber::set_default(subscriber)
+    }
+
+    /// Mirrors `src/scan/logs.rs::tests::parse_events`.
+    fn parse_events(captured: &str) -> Vec<serde_json::Value> {
+        captured
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("tracing line is JSON"))
+            .collect()
+    }
+
+    /// Mirrors `src/scan/logs.rs::tests::find_event`.
+    fn find_event<'a>(events: &'a [serde_json::Value], message: &str) -> &'a serde_json::Value {
+        events
+            .iter()
+            .find(|e| e.pointer("/fields/message").and_then(|m| m.as_str()) == Some(message))
+            .unwrap_or_else(|| panic!("expected event with message {message:?}; got {events:#?}"))
+    }
+
+    /// Mirrors `src/scan/logs.rs::tests::event_runs_in_log_scan`.
+    fn event_runs_in_log_scan(event: &serde_json::Value) -> bool {
+        event
+            .get("spans")
+            .and_then(|s| s.as_array())
+            .map(|spans| {
+                spans
+                    .iter()
+                    .any(|s| s.get("name").and_then(|n| n.as_str()) == Some("log_scan"))
+            })
+            .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn tracing_is_chain_neutral_and_records_chunk_dimensions() {
+        let writer = CapturingWriter::default();
+        {
+            let _g = install_subscriber(writer.clone());
+            let transport = ScriptedTransport::default();
+            // 0..=299 in 100-block chunks = 3 chunks.
+            for _ in 0..3 {
+                transport.push_success("eth_getLogs", &Vec::<RpcLog>::new());
+            }
+            let provider = build_provider(transport);
+            let filter = Filter::new().from_block(0).to_block(299);
+
+            fetch_logs_chunked(&provider, filter, 100)
+                .await
+                .expect("happy-path chunked fetch must succeed");
+        }
+
+        let events = parse_events(&writer.captured());
+        for event in &events {
+            assert!(
+                event.pointer("/fields/chain").is_none(),
+                "fetch_logs_chunked event must not carry chain as a direct field: {event}"
+            );
+            assert!(
+                !event_runs_in_log_scan(event),
+                "fetch_logs_chunked must not route through the chain-bearing log_scan span: {event}"
+            );
+        }
+
+        let start = find_event(&events, "Starting log scan");
+        assert_eq!(
+            start.pointer("/fields/chunk_size").and_then(|v| v.as_u64()),
+            Some(100),
+            "start event must record chunk_size for capacity-planning dashboards: {start}"
+        );
+        assert_eq!(
+            start.pointer("/fields/num_chunks").and_then(|v| v.as_u64()),
+            Some(3),
+            "start event must record num_chunks for capacity-planning dashboards: {start}"
         );
     }
 }
