@@ -624,16 +624,25 @@ impl<P: Provider> BlockWindowCalculator<P> {
     /// refetches the full `(block, ts)` pair rather than reusing the cached
     /// block number.
     ///
-    /// Dates whose `start_ts` is strictly past the memoized chain-head
-    /// timestamp, or whose `end_ts_exclusive` extends at or past it, are
-    /// **not** persisted to the `BlockWindowCache`. Such windows depend on
-    /// future chain state that the cache key `(chain, date)` cannot
-    /// disambiguate: a window computed against head `H` would silently
-    /// shadow the correct window once the chain advanced past `H` into the
-    /// day's range. The no-cache gate fires only when a full memo entry is
-    /// available (populated by a prior [`Self::block_range_for_timestamps`]
-    /// call within the TTL); a cold-memo daily-window call lacks the
-    /// timestamp and still caches as before.
+    /// A window is persisted to the `BlockWindowCache` only when the
+    /// memoized head's timestamp confirms the day ends strictly before
+    /// the chain tip. Two cases force a cache skip:
+    ///
+    /// 1. **Tip-touching or past-tip dates** (full memo entry,
+    ///    `end_ts_exclusive` at or past `latest_ts`). The window depends
+    ///    on future chain state that the cache key `(chain, date)`
+    ///    cannot disambiguate: a window computed against head `H` would
+    ///    silently shadow the correct window once the chain advanced
+    ///    past `H` into the day's range.
+    /// 2. **Cold memo** (no prior
+    ///    [`Self::block_range_for_timestamps`] call; the memo holds
+    ///    only the head's block number, no `latest_ts`). Without
+    ///    `latest_ts` the caller cannot distinguish a fully-historical
+    ///    day from one whose head sits inside the requested day, so
+    ///    the conservative shape is to refuse to persist. The
+    ///    best-effort window is still returned to the caller; only the
+    ///    cache insert is skipped, at a cost of one extra binary
+    ///    search on a subsequent cold restart for the same date.
     ///
     /// # Arguments
     /// * `chain` - The named chain for which to calculate the block window
@@ -947,13 +956,16 @@ where
 ///   the day's range, and the cache key `(chain, date)` has no notion of
 ///   which head was current when the window was computed.
 ///
-/// Cold-memo daily-window calls (no prior
-/// [`BlockWindowCalculator::block_range_for_timestamps`]) retain the
-/// pre-existing behaviour: the timestamp is unknown, the short-circuits
-/// cannot fire, and the result is cached as before. The widened failure
-/// surface introduced by the shared memo — a stale `latest_ts` left by an
-/// earlier `block_range_for_timestamps` call shadowing a `get_daily_window`
-/// query for today's date — is closed.
+/// The cache insert is gated on the memoized head's timestamp being
+/// known *and* the day ending strictly before it. A cold-memo
+/// daily-window call (no prior
+/// [`BlockWindowCalculator::block_range_for_timestamps`]) holds only
+/// the head's block number — `latest_ts` is `None` — and so cannot
+/// confirm that the day is genuinely historical: the actual head may
+/// still sit inside the requested day. Such calls return the
+/// best-effort binary-search window but skip the cache insert,
+/// preventing a truncated window (`end_block` clamped to the head)
+/// from being persisted and shadowed across restarts.
 async fn get_daily_window_with<F, FtFut, G, GnFut>(
     bounds_memo: &ChainBoundsMemo,
     cache: &dyn BlockWindowCache,
