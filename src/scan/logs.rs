@@ -18,8 +18,9 @@ use alloy_provider::Provider;
 use alloy_rpc_types::{Filter, Log};
 use alloy_transport::TransportError;
 use std::marker::PhantomData;
+use std::time::Duration;
 use tokio::time::sleep;
-use tracing::{debug, error};
+use tracing::{debug, error, Instrument};
 
 use crate::config::SemioscanConfig;
 
@@ -56,7 +57,11 @@ where
         }
     }
 
-    /// Scan `start_block..=end_block` for logs matching `filter_template`.
+    /// Scan `start_block..=end_block` for logs matching `filter_template`,
+    /// using chunk size and rate-limit delay resolved from [`SemioscanConfig`]
+    /// for `chain`. Tracing events emitted by the scan are tagged with
+    /// `chain = <chain>` via a parent span so per-chain dashboards can filter
+    /// them.
     ///
     /// The block range is split into chunks of `config.get_max_block_range(chain)`
     /// blocks. For each chunk, `filter_template` is cloned and stamped with the
@@ -66,6 +71,11 @@ where
     /// On a per-chunk transport error, `on_chunk_error` is called:
     /// - `None`  — log the error and continue with the next chunk.
     /// - `Some(err)` — abort the scan and return `Err(err)`.
+    ///
+    /// Callers that have no chain to attribute the scan to (e.g.
+    /// [`crate::fetch_logs_chunked`]) should use [`LogScanner::scan_raw`]
+    /// instead, which omits the chain dimension entirely rather than picking
+    /// a sentinel.
     ///
     /// # Panics
     ///
@@ -78,25 +88,69 @@ where
         filter_template: Filter,
         start_block: BlockNumber,
         end_block: BlockNumber,
-        mut on_chunk_error: F,
+        on_chunk_error: F,
     ) -> Result<Vec<Log>, E>
     where
         F: FnMut(TransportError) -> Option<E>,
     {
-        debug!(
-            chain = %chain,
-            start_block,
-            end_block,
-            "Starting log scan"
-        );
-
-        let max_block_range = self.config.get_max_block_range(chain);
-        let chunk_size = max_block_range.as_u64();
+        let chunk_size = self.config.get_max_block_range(chain).as_u64();
         assert!(
             chunk_size > 0,
             "chunk size for {chain:?} must be > 0; got 0 from SemioscanConfig"
         );
         let rate_limit = self.config.get_rate_limit_delay(chain);
+
+        self.scan_raw(
+            chunk_size,
+            rate_limit,
+            filter_template,
+            start_block,
+            end_block,
+            on_chunk_error,
+        )
+        .instrument(tracing::debug_span!("log_scan", chain = %chain))
+        .await
+    }
+
+    /// Chain-neutral entrypoint that drives the same chunked scan as
+    /// [`LogScanner::scan`] but takes `chunk_size` and `rate_limit` directly
+    /// rather than resolving them from a chain key.
+    ///
+    /// Tracing events emitted here carry the structural shape of the scan
+    /// (`start_block`, `end_block`, `chunk_size`, `num_chunks`,
+    /// `current_block`, `to_block`, `logs_count`, `total_logs`) but no
+    /// `chain` field. Callers that do have a chain in hand should reach
+    /// [`LogScanner::scan`] so the chain is attached as a parent-span field.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `chunk_size` is 0.
+    pub async fn scan_raw<E, F>(
+        &self,
+        chunk_size: u64,
+        rate_limit: Option<Duration>,
+        filter_template: Filter,
+        start_block: BlockNumber,
+        end_block: BlockNumber,
+        mut on_chunk_error: F,
+    ) -> Result<Vec<Log>, E>
+    where
+        F: FnMut(TransportError) -> Option<E>,
+    {
+        assert!(chunk_size > 0, "chunk_size must be > 0");
+
+        let num_chunks = if start_block > end_block {
+            0
+        } else {
+            (end_block - start_block)
+                .saturating_add(1)
+                .div_ceil(chunk_size)
+        };
+
+        debug!(
+            start_block,
+            end_block, chunk_size, num_chunks, "Starting log scan"
+        );
 
         let mut all_logs = Vec::new();
         let mut current_block = start_block;
@@ -115,12 +169,7 @@ where
                 .from_block(current_block)
                 .to_block(to_block);
 
-            debug!(
-                chain = %chain,
-                current_block,
-                to_block,
-                "Fetching logs for chunk"
-            );
+            debug!(current_block, to_block, "Fetching logs for chunk");
 
             match self.provider.get_logs(&filter).await {
                 Ok(logs) => {
@@ -155,21 +204,13 @@ where
 
             if let Some(delay) = rate_limit {
                 if current_block <= end_block {
-                    debug!(
-                        chain = %chain,
-                        delay_ms = delay.as_millis(),
-                        "Applying rate limit delay"
-                    );
+                    debug!(delay_ms = delay.as_millis(), "Applying rate limit delay");
                     sleep(delay).await;
                 }
             }
         }
 
-        debug!(
-            chain = %chain,
-            total_logs = all_logs.len(),
-            "Finished log scan"
-        );
+        debug!(total_logs = all_logs.len(), "Finished log scan");
 
         Ok(all_logs)
     }
@@ -668,5 +709,117 @@ mod tests {
                 None
             })
             .await;
+    }
+
+    /// JSON-line tracing capture for asserting on event fields. Each
+    /// formatted event is appended as a UTF-8 line; tests inspect the
+    /// flattened transcript with substring checks.
+    #[derive(Clone, Default)]
+    struct CapturingWriter {
+        buf: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl CapturingWriter {
+        fn captured(&self) -> String {
+            String::from_utf8(self.buf.lock().expect("capture buffer lock").clone())
+                .expect("captured tracing output should be valid UTF-8")
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturingWriter {
+        type Writer = CapturingWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl std::io::Write for CapturingWriter {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.buf
+                .lock()
+                .expect("capture buffer lock")
+                .extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn install_subscriber(writer: CapturingWriter) -> tracing::subscriber::DefaultGuard {
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(writer)
+            .with_current_span(true)
+            .with_span_list(true)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        tracing::subscriber::set_default(subscriber)
+    }
+
+    #[tokio::test]
+    async fn scan_raw_tracing_carries_chunk_size_and_num_chunks_without_chain() {
+        let writer = CapturingWriter::default();
+        {
+            let _g = install_subscriber(writer.clone());
+            let transport = ScriptedTransport::default();
+            for _ in 0..3 {
+                transport.push_success("eth_getLogs", &empty_log_response());
+            }
+            let provider = build_provider(transport);
+            let scanner = LogScanner::new(provider, config_with_chunk_size(100));
+
+            scanner
+                .scan_raw::<std::convert::Infallible, _>(100, None, Filter::new(), 0, 299, |_| None)
+                .await
+                .expect("scan_raw happy path");
+        }
+
+        let captured = writer.captured();
+        assert!(
+            !captured.contains("\"chain\""),
+            "scan_raw must not emit a chain field; got:\n{captured}"
+        );
+        assert!(
+            captured.contains("\"chunk_size\":100"),
+            "scan_raw start event must record chunk_size; got:\n{captured}"
+        );
+        assert!(
+            captured.contains("\"num_chunks\":3"),
+            "scan_raw start event must record num_chunks; got:\n{captured}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_tracing_tags_events_with_chain_via_span() {
+        let writer = CapturingWriter::default();
+        {
+            let _g = install_subscriber(writer.clone());
+            let transport = ScriptedTransport::default();
+            transport.push_success("eth_getLogs", &empty_log_response());
+            let provider = build_provider(transport);
+            let scanner = LogScanner::new(provider, config_with_chunk_size(100));
+
+            scanner
+                .scan::<std::convert::Infallible, _>(
+                    NamedChain::Arbitrum,
+                    Filter::new(),
+                    0,
+                    50,
+                    |_| None,
+                )
+                .await
+                .expect("scan happy path");
+        }
+
+        let captured = writer.captured();
+        assert!(
+            captured.contains("\"chain\""),
+            "scan must tag events with chain via the log_scan span; got:\n{captured}"
+        );
+        assert!(
+            captured.to_lowercase().contains("arbitrum"),
+            "chain span field must serialize the supplied NamedChain; got:\n{captured}"
+        );
     }
 }
