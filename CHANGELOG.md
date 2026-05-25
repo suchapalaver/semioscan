@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `GasCache` and `PriceCache` no longer return an over-counted aggregate
+  when a query window is narrower than a cached entry. Before, a cache
+  holding `[50, 350]` would answer a `[100, 300]` query with the wider
+  range's totals, inflating gas, transaction-count, and USDC figures by
+  the contributions of blocks `50..=99` and `301..=350`. Daily/per-window
+  reports run against the same cache could no longer be reconciled
+  against an independent ledger. The cache now answers the narrower
+  query by rescanning the requested window and returning totals scoped
+  to it. Closes #29.
+
+### Changed
+
+- `GasCache::get`, `PriceCache::get`, and the underlying
+  `BlockRangeCache::get` now return a cached value only on an exact
+  range match. Calls that previously succeeded because a wider cached
+  entry contained the query window now return `None`; use
+  `calculate_gaps` for gap-aware lookup.
+- `calculate_gaps` returns merged data only from cached entries that lie
+  fully inside the query window. A wider entry that extends outside the
+  window is ignored and the whole window is reported as a gap so the
+  caller can produce a window-scoped aggregate. As a consequence, a
+  narrower query against a cache holding a wider partially-overlapping
+  entry will rescan its window on every call until the wider entry is
+  invalidated; consumers that need both granularities should query at
+  the narrower window first or call `clear_signer_data` /
+  `clear_old_blocks` between phases.
+
 ## [0.14.1] - 2026-05-25
 
 ### Changed
