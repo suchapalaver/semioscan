@@ -4,8 +4,9 @@
 
 //! In-memory cache for gas cost calculations with gap detection
 //!
-//! This module provides intelligent caching for gas cost calculations that supports:
-//! - Automatic merging of overlapping block ranges
+//! This module provides caching for gas cost calculations that supports:
+//! - Disjoint storage of cached block ranges (so aggregate costs are never
+//!   silently double-counted when ranges overlap)
 //! - Gap detection to identify uncached regions
 //! - Cache invalidation by address or block height
 //!
@@ -70,41 +71,23 @@ use crate::gas::calculator::GasCostResult;
 // Implement Mergeable for GasCostResult
 impl Mergeable for GasCostResult {
     fn merge(&mut self, other: &Self) {
-        self.total_gas_cost = self.total_gas_cost + other.total_gas_cost;
-        self.transaction_count += other.transaction_count;
+        GasCostResult::merge(self, other);
     }
 }
 
 /// In-memory cache for gas cost calculation results
 ///
-/// Stores gas cost data keyed by `(from, to, start_block, end_block)` and provides
-/// intelligent features like automatic range merging and gap detection.
+/// Stores gas cost data keyed by `(from, to, start_block, end_block)`. Cached
+/// ranges for the same address pair are kept disjoint so aggregates are never
+/// double-counted when a query overlaps prior inserts.
 ///
 /// # Features
 ///
 /// - **Range queries**: Retrieve cached data that fully contains a requested range
-/// - **Auto-merging**: Overlapping inserts are automatically merged
+/// - **Disjoint storage**: Inserts that partially overlap existing entries are
+///   resolved without combining their aggregates (see [`Self::insert`])
 /// - **Gap detection**: Calculate precisely which blocks are not yet cached
 /// - **Cache management**: Clear by address or block height
-///
-/// # Example
-///
-/// ```rust
-/// use semioscan::{GasCache, GasCostResult};
-/// use alloy_chains::NamedChain;
-/// use alloy_primitives::Address;
-///
-/// let mut cache = GasCache::default();
-/// let from = Address::ZERO;
-/// let to = Address::ZERO;
-///
-/// // Insert results for different block ranges
-/// cache.insert(from, to, 100, 200, GasCostResult::new(NamedChain::Mainnet, from, to));
-/// cache.insert(from, to, 150, 250, GasCostResult::new(NamedChain::Mainnet, from, to));
-///
-/// // Overlapping ranges are merged automatically
-/// assert_eq!(cache.len(), 1);
-/// ```
 #[derive(Debug, Clone, Default)]
 pub struct GasCache {
     inner: BlockRangeCache<(Address, Address), GasCostResult>,
@@ -159,13 +142,19 @@ impl GasCache {
         self.inner.get(&(from, to), start_block, end_block)
     }
 
-    /// Insert a result and automatically merge with overlapping entries
+    /// Insert a result while keeping cached ranges disjoint
     ///
-    /// When inserting a result that overlaps with existing cached data, this method:
-    /// 1. Finds all overlapping entries
-    /// 2. Merges their gas costs and transaction counts
-    /// 3. Extends the block range to cover all overlapping entries
-    /// 4. Removes the old entries and stores the merged result
+    /// Overlap is resolved by choosing whose range is authoritative rather
+    /// than combining aggregates:
+    ///
+    /// - **No overlap with existing entries**: stored as a new disjoint segment.
+    /// - **`[start_block, end_block]` covers every overlapping entry**: those
+    ///   entries are replaced with the new value (intended for the calculator
+    ///   pattern of writing back an aggregate for the full query range after
+    ///   filling gaps).
+    /// - **An existing entry already covers `[start_block, end_block]`** or the
+    ///   ranges only partially overlap: the new insert is dropped so existing
+    ///   aggregates are never combined with overlapping data.
     ///
     /// # Arguments
     ///
@@ -174,33 +163,6 @@ impl GasCache {
     /// * `start_block` - Start of block range (inclusive)
     /// * `end_block` - End of block range (inclusive)
     /// * `result` - Gas cost data for this range
-    ///
-    /// # Example: Auto-merging
-    ///
-    /// ```rust
-    /// use semioscan::{GasCache, GasCostResult, TransactionCount};
-    /// use alloy_chains::NamedChain;
-    /// use alloy_primitives::Address;
-    ///
-    /// let mut cache = GasCache::default();
-    /// let from = Address::ZERO;
-    /// let to = Address::ZERO;
-    ///
-    /// // Insert blocks 100-200 with 5 transactions
-    /// let mut result1 = GasCostResult::new(NamedChain::Mainnet, from, to);
-    /// result1.transaction_count = TransactionCount::new(5);
-    /// cache.insert(from, to, 100, 200, result1);
-    ///
-    /// // Insert overlapping blocks 150-250 with 3 transactions
-    /// let mut result2 = GasCostResult::new(NamedChain::Mainnet, from, to);
-    /// result2.transaction_count = TransactionCount::new(3);
-    /// cache.insert(from, to, 150, 250, result2);
-    ///
-    /// // Results are merged: 1 entry covering 100-250 with 8 transactions
-    /// assert_eq!(cache.len(), 1);
-    /// let merged = cache.get(from, to, 100, 250).unwrap();
-    /// assert_eq!(merged.transaction_count, TransactionCount::new(8));
-    /// ```
     pub fn insert(
         &mut self,
         from: Address,
@@ -461,12 +423,14 @@ mod tests {
     }
 
     #[test]
-    fn test_overlap_merging() {
+    fn test_partial_overlap_does_not_double_count() {
+        // Two partially overlapping inserts must never collapse into a single
+        // aggregate that counts the overlapping blocks twice. The earlier entry
+        // is kept untouched.
         let mut cache = GasCache::default();
         let from = Address::ZERO;
         let to = Address::ZERO;
 
-        // Insert overlapping ranges
         cache.insert(
             from,
             to,
@@ -482,16 +446,90 @@ mod tests {
             create_test_result(NamedChain::Mainnet, from, to, 3, 60_000),
         );
 
-        // Should have merged the two entries
+        assert!(
+            cache.get(from, to, 100, 400).is_none(),
+            "no cached entry should claim coverage of [100, 400]"
+        );
+        let kept = cache
+            .get(from, to, 100, 300)
+            .expect("original range preserved");
+        assert_eq!(kept.transaction_count, TransactionCount::new(5));
+        assert_eq!(kept.total_gas_cost, WeiAmount::from(100_000u64));
+    }
+
+    #[test]
+    fn test_covering_insert_replaces_prior_segments() {
+        // Mirrors the calculator pattern: scan two disjoint gaps, then write
+        // back a single aggregate for the full query range. The cache must
+        // collapse the prior segments into the new authoritative entry rather
+        // than re-merge them.
+        let mut cache = GasCache::default();
+        let from = Address::ZERO;
+        let to = Address::ZERO;
+
+        cache.insert(
+            from,
+            to,
+            100,
+            150,
+            create_test_result(NamedChain::Mainnet, from, to, 2, 20_000),
+        );
+        cache.insert(
+            from,
+            to,
+            200,
+            250,
+            create_test_result(NamedChain::Mainnet, from, to, 3, 30_000),
+        );
+
+        // Caller already merged the prior cache and the rescanned gap into this
+        // result; passing it straight back must not be added to the prior
+        // entries.
+        let aggregated = create_test_result(NamedChain::Mainnet, from, to, 7, 90_000);
+        cache.insert(from, to, 100, 250, aggregated);
+
         assert_eq!(cache.len(), 1);
+        let stored = cache.get(from, to, 100, 250).unwrap();
+        assert_eq!(stored.transaction_count, TransactionCount::new(7));
+        assert_eq!(stored.total_gas_cost, WeiAmount::from(90_000u64));
+    }
 
-        // Get the merged range
-        let cached = cache.get(from, to, 100, 400);
-        assert!(cached.is_some());
+    #[test]
+    fn test_cache_merge_preserves_gas_breakdown() {
+        // Caching gas data must not silently drop the breakdown - regression
+        // for Mergeable<GasCostResult> only updating total/count.
+        use crate::types::gas::{BlobCount, GasBreakdown};
+        use alloy_primitives::U256;
 
-        let result = cached.unwrap();
-        assert_eq!(result.transaction_count, TransactionCount::new(8));
-        assert_eq!(result.total_gas_cost, WeiAmount::from(160_000u64));
+        let mut cache = GasCache::default();
+        let from = Address::ZERO;
+        let to = Address::ZERO;
+
+        let mut first = create_test_result(NamedChain::Mainnet, from, to, 1, 1_000);
+        first.breakdown = GasBreakdown::builder()
+            .execution_gas_cost(U256::from(700u64))
+            .blob_gas_cost(U256::from(200u64))
+            .l1_data_fee(U256::from(100u64))
+            .blob_count(BlobCount::new(2))
+            .build();
+        cache.insert(from, to, 100, 200, first);
+
+        let mut second = create_test_result(NamedChain::Mainnet, from, to, 1, 500);
+        second.breakdown = GasBreakdown::builder()
+            .execution_gas_cost(U256::from(400u64))
+            .blob_gas_cost(U256::from(50u64))
+            .l1_data_fee(U256::from(50u64))
+            .blob_count(BlobCount::new(1))
+            .build();
+        cache.insert(from, to, 300, 400, second);
+
+        let (merged, gaps) = cache.calculate_gaps(NamedChain::Mainnet, from, to, 100, 400);
+        let merged = merged.expect("cached segments are merged for the query");
+        assert_eq!(gaps, vec![(201, 299)]);
+        assert_eq!(merged.breakdown.execution_gas_cost, U256::from(1_100u64));
+        assert_eq!(merged.breakdown.blob_gas_cost, U256::from(250u64));
+        assert_eq!(merged.breakdown.l1_data_fee, U256::from(150u64));
+        assert_eq!(merged.breakdown.blob_count, BlobCount::new(3));
     }
 
     mod proptests {

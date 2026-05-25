@@ -55,16 +55,15 @@ impl From<BlockRange> for (BlockNumber, BlockNumber) {
 // Implement Mergeable for TokenPriceResult
 impl Mergeable for TokenPriceResult {
     fn merge(&mut self, other: &Self) {
-        self.total_token_amount += other.total_token_amount;
-        self.total_usdc_amount += other.total_usdc_amount;
-        self.transaction_count += other.transaction_count;
+        TokenPriceResult::merge(self, other);
     }
 }
 
 /// Cache for token price calculation results
 ///
-/// This cache stores price data keyed by `(token_address, start_block, end_block)` and provides
-/// intelligent features like automatic range merging and gap detection.
+/// Stores price data keyed by `(token_address, start_block, end_block)`. Cached
+/// ranges for the same token are kept disjoint so aggregate token and USDC
+/// amounts are never double-counted when ranges overlap.
 #[derive(Debug, Clone, Default)]
 pub struct PriceCache {
     inner: BlockRangeCache<Address, TokenPriceResult>,
@@ -85,10 +84,19 @@ impl PriceCache {
         self.inner.get(&token_address, start_block, end_block)
     }
 
-    /// Insert a new result, potentially merging with existing results
+    /// Insert a result while keeping cached ranges disjoint
     ///
-    /// When inserting a result that overlaps with existing cached data, this method
-    /// automatically merges the price data and extends the block range.
+    /// Overlap is resolved by choosing whose range is authoritative rather
+    /// than combining aggregates:
+    ///
+    /// - **No overlap with existing entries**: stored as a new disjoint segment.
+    /// - **`[start_block, end_block]` covers every overlapping entry**: those
+    ///   entries are replaced with the new value (intended for the calculator
+    ///   pattern of writing back an aggregate for the full query range after
+    ///   filling gaps).
+    /// - **An existing entry already covers `[start_block, end_block]`** or the
+    ///   ranges only partially overlap: the new insert is dropped so existing
+    ///   aggregates are never combined with overlapping data.
     pub fn insert(
         &mut self,
         token_address: Address,
@@ -398,27 +406,47 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_with_overlap_merges() {
+    fn test_insert_partial_overlap_does_not_double_count() {
+        // Two partially overlapping inserts must never produce a single cached
+        // entry whose aggregate counts the overlapping blocks twice. The first
+        // entry is kept; the second is dropped to preserve disjoint segments.
         let mut cache = PriceCache::default();
         let token = address!("0000000000000000000000000000000000000001");
 
-        // Insert first range: 100-200
         cache.insert(token, 100, 200, create_price_result(token, 500.0, 250.0));
-
-        // Insert overlapping range: 150-250
         cache.insert(token, 150, 250, create_price_result(token, 800.0, 400.0));
 
-        // Should be merged into single range: 100-250
-        let result = cache.get(token, 100, 250);
-        assert!(result.is_some(), "Should find merged range");
+        assert!(
+            cache.get(token, 100, 250).is_none(),
+            "no cached entry should claim coverage of [100, 250]"
+        );
+        let kept = cache
+            .get(token, 100, 200)
+            .expect("original range preserved");
+        assert_eq!(kept.total_token_amount.as_f64(), 500.0);
+        assert_eq!(kept.total_usdc_amount.as_f64(), 250.0);
+    }
 
-        let merged = result.unwrap();
-        assert_eq!(merged.total_token_amount.as_f64(), 1300.0); // 500 + 800
-        assert_eq!(merged.total_usdc_amount.as_f64(), 650.0); // 250 + 400
+    #[test]
+    fn test_covering_insert_replaces_prior_segments() {
+        // Calculator pattern: a final aggregate that covers prior gap-fill
+        // inserts must collapse those entries to a single authoritative entry
+        // instead of being re-merged into them.
+        let mut cache = PriceCache::default();
+        let token = address!("0000000000000000000000000000000000000001");
 
-        // Original individual ranges should not be separately cached
+        cache.insert(token, 100, 150, create_price_result(token, 100.0, 50.0));
+        cache.insert(token, 200, 250, create_price_result(token, 200.0, 100.0));
+
+        // Caller-aggregated total for [100, 250] including both prior segments
+        // and the rescanned middle gap.
+        cache.insert(token, 100, 250, create_price_result(token, 450.0, 225.0));
+
+        let stored = cache.get(token, 100, 250).expect("covering range cached");
+        assert_eq!(stored.total_token_amount.as_f64(), 450.0);
+        assert_eq!(stored.total_usdc_amount.as_f64(), 225.0);
         let (_, gaps) = cache.calculate_gaps(token, 100, 250);
-        assert_eq!(gaps.len(), 0, "No gaps in merged range");
+        assert!(gaps.is_empty());
     }
 
     #[test]
@@ -452,31 +480,31 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_multiple_overlaps_merges_all() {
+    fn test_partial_overlap_insert_leaves_prior_disjoint_segments() {
+        // A new range that only partially overlaps existing segments (here the
+        // outer two) cannot be safely combined with their aggregates, so it is
+        // dropped. The disjoint segments are preserved and `calculate_gaps`
+        // still reports the real uncached blocks.
         let mut cache = PriceCache::default();
         let token = address!("0000000000000000000000000000000000000001");
 
-        // Insert three separate ranges
         cache.insert(token, 100, 150, create_price_result(token, 100.0, 50.0));
         cache.insert(token, 200, 250, create_price_result(token, 200.0, 100.0));
         cache.insert(token, 300, 350, create_price_result(token, 300.0, 150.0));
 
-        // Insert a range that overlaps all three: 140-340
-        cache.insert(token, 140, 340, create_price_result(token, 500.0, 250.0));
+        // Partially overlaps [100, 150] and [300, 350]; fully contains [200, 250].
+        cache.insert(token, 140, 340, create_price_result(token, 999.0, 999.0));
 
-        // Should merge everything into 100-350
-        let result = cache.get(token, 100, 350);
-        assert!(result.is_some(), "All ranges should be merged");
-
-        let merged = result.unwrap();
-        // Total: 100 + 200 + 300 + 500 = 1100
-        assert_eq!(merged.total_token_amount.as_f64(), 1100.0);
-        // Total: 50 + 100 + 150 + 250 = 550
-        assert_eq!(merged.total_usdc_amount.as_f64(), 550.0);
-
-        // No gaps in the merged range
-        let (_, gaps) = cache.calculate_gaps(token, 100, 350);
-        assert_eq!(gaps.len(), 0, "No gaps after merging all overlaps");
+        let (merged, gaps) = cache.calculate_gaps(token, 100, 350);
+        let merged = merged.expect("cached segments are merged for query");
+        // Only the three original segments contribute, no double-count of the
+        // dropped partial-overlap insert.
+        assert_eq!(merged.total_token_amount.as_f64(), 600.0);
+        assert_eq!(merged.total_usdc_amount.as_f64(), 300.0);
+        assert_eq!(
+            gaps,
+            vec![BlockRange::new(151, 199), BlockRange::new(251, 299)]
+        );
     }
 
     #[test]
