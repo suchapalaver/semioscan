@@ -174,6 +174,16 @@ pub struct BlockWindowCalculator<P> {
     provider: P,
     cache: Box<dyn BlockWindowCache>,
     bounds_memo: ChainBoundsMemo,
+    /// When `true`, [`Self::get_daily_window`] routes head fetches through
+    /// [`ChainBoundsMemo::get_or_fetch_head`] (full `(block, ts)` pair)
+    /// rather than [`ChainBoundsMemo::get_or_fetch_latest_block`] (block
+    /// number only). [`Self::with_disk_cache`] sets this so the
+    /// cold-memo daily-window path can confirm a day is fully
+    /// historical and actually persist the result to disk — without
+    /// `latest_ts` the conservative skip-insert branch always fires and
+    /// the disk cache file stays empty for daily-window-only callers.
+    /// See [`Self::with_disk_cache`]'s rustdoc and #18.
+    eager_head_ts: bool,
 }
 
 /// Memoized chain bounds shared across calls to
@@ -347,6 +357,7 @@ impl<P: Provider> BlockWindowCalculator<P> {
             provider,
             cache,
             bounds_memo: ChainBoundsMemo::new(DEFAULT_HEAD_TTL),
+            eager_head_ts: false,
         }
     }
 
@@ -419,6 +430,29 @@ impl<P: Provider> BlockWindowCalculator<P> {
     /// - The parent directory doesn't exist and cannot be created
     /// - The parent directory is not writable
     ///
+    /// # Behavior
+    ///
+    /// This constructor opts into the **eager head-timestamp fetch** for
+    /// [`Self::get_daily_window`]: the calculator fetches the chain
+    /// head's full `(block, timestamp)` pair on the cold-memo path
+    /// instead of just the block number. Without the head's timestamp,
+    /// [`Self::get_daily_window`] cannot distinguish a fully-historical
+    /// day from one whose head sits inside the requested day, and
+    /// conservatively skips the cache insert — so a daily-window-only
+    /// consumer paired with [`Self::with_memory_cache`]-style internals
+    /// would see an empty disk cache file across restarts. The disk
+    /// cache backend exists specifically to amortize binary searches
+    /// across process restarts, so this constructor accepts the cost of
+    /// one extra `eth_getBlockByNumber(head)` per head-TTL window per
+    /// chain to keep that promise. The same memo is shared with
+    /// [`Self::block_range_for_timestamps`], so mixed workloads pay the
+    /// fetch only once per TTL regardless of which method triggered it.
+    ///
+    /// Consumers that need disk-style persistence but want to avoid the
+    /// eager head fetch can construct via [`Self::new`] with a hand-rolled
+    /// [`DiskCache`]; that path preserves the conservative default. See
+    /// #18 for the failure scenario this constructor's behavior addresses.
+    ///
     /// # Examples
     ///
     /// ```rust,ignore
@@ -438,7 +472,12 @@ impl<P: Provider> BlockWindowCalculator<P> {
         cache_path: impl AsRef<Path>,
     ) -> Result<Self, BlockWindowError> {
         let cache = DiskCache::new(cache_path.as_ref()).validate()?;
-        Ok(Self::new(provider, Box::new(cache)))
+        Ok(Self {
+            provider,
+            cache: Box::new(cache),
+            bounds_memo: ChainBoundsMemo::new(DEFAULT_HEAD_TTL),
+            eager_head_ts: true,
+        })
     }
 
     /// Creates a calculator with an in-memory cache
@@ -643,6 +682,9 @@ impl<P: Provider> BlockWindowCalculator<P> {
     ///    best-effort window is still returned to the caller; only the
     ///    cache insert is skipped, at a cost of one extra binary
     ///    search on a subsequent cold restart for the same date.
+    ///    Calculators constructed via [`Self::with_disk_cache`] avoid
+    ///    this case by fetching the head's full `(block, ts)` pair
+    ///    eagerly — see that constructor's "Behavior" section.
     ///
     /// # Arguments
     /// * `chain` - The named chain for which to calculate the block window
@@ -676,6 +718,7 @@ impl<P: Provider> BlockWindowCalculator<P> {
         get_daily_window_with(
             &self.bounds_memo,
             self.cache.as_ref(),
+            self.eager_head_ts,
             chain,
             date,
             |n| self.get_block_timestamp(n),
@@ -922,22 +965,39 @@ where
 /// [`ChainBoundsMemo`], binary search, and cache insertion — can be exercised
 /// in tests without a live RPC.
 ///
-/// The chain head's block number is routed through
-/// [`ChainBoundsMemo::get_or_fetch_latest_block`] — the thinner sibling of
-/// [`ChainBoundsMemo::get_or_fetch_head`] that fetches only the block
-/// number. The binary search needs the block number to bound its probes but
-/// never the head's timestamp, so the daily-window path doesn't pay the
-/// `eth_getBlockByNumber(head)` round-trip nor inherit its transient
-/// failure modes (one-block tip reorgs, free-tier provider cache lag).
+/// `eager_head_ts` selects the head-fetch shape:
+///
+/// - `false` (the default for calculators constructed via
+///   [`BlockWindowCalculator::with_memory_cache`], [`BlockWindowCalculator::without_cache`],
+///   and [`BlockWindowCalculator::new`]): the chain head's block number is
+///   routed through [`ChainBoundsMemo::get_or_fetch_latest_block`] — the
+///   thinner sibling of [`ChainBoundsMemo::get_or_fetch_head`] that fetches
+///   only the block number. The binary search needs the block number to
+///   bound its probes but never the head's timestamp, so the daily-window
+///   path doesn't pay the `eth_getBlockByNumber(head)` round-trip nor
+///   inherit its transient failure modes (one-block tip reorgs, free-tier
+///   provider cache lag). The trade-off: cold-memo calls cannot confirm
+///   the requested day is fully historical and conservatively skip the
+///   cache insert — see "Cold memo" in
+///   [`BlockWindowCalculator::get_daily_window`]'s rustdoc.
+/// - `true` (the default for calculators constructed via
+///   [`BlockWindowCalculator::with_disk_cache`]): the chain head's full
+///   `(block, ts)` pair is fetched via
+///   [`ChainBoundsMemo::get_or_fetch_head`] so cold-memo calls have
+///   `latest_ts` in hand and can confirm historical days are safe to
+///   persist. Re-introduces the transient-tip failure surface that the
+///   `false` path was designed to avoid, but a persistent cache that
+///   never persists is worse than retrying a transient failure — see
+///   #18 and [`BlockWindowCalculator::with_disk_cache`]'s rustdoc.
 ///
 /// Storage is shared with [`ChainBoundsMemo::get_or_fetch_head`]: a head
 /// populated here is reused by subsequent
 /// [`BlockWindowCalculator::get_daily_window`] calls within the TTL.
 /// [`BlockWindowCalculator::block_range_for_timestamps`] treats a partial
-/// entry left here as a miss and refetches the full `(block, ts)` pair —
-/// the closure it supplies to [`ChainBoundsMemo::get_or_fetch_head`] fetches
-/// both, so the partial block number is discarded rather than upgraded in
-/// place.
+/// entry left by the `false` path as a miss and refetches the full
+/// `(block, ts)` pair — the closure it supplies to
+/// [`ChainBoundsMemo::get_or_fetch_head`] fetches both, so the partial
+/// block number is discarded rather than upgraded in place.
 ///
 /// # Tip-adjacent and past-tip dates
 ///
@@ -969,6 +1029,7 @@ where
 async fn get_daily_window_with<F, FtFut, G, GnFut>(
     bounds_memo: &ChainBoundsMemo,
     cache: &dyn BlockWindowCache,
+    eager_head_ts: bool,
     chain: NamedChain,
     date: NaiveDate,
     mut fetch_ts: F,
@@ -1005,9 +1066,25 @@ where
     let start_ts = UnixTimestamp::from_datetime(start_dt);
     let end_ts_exclusive = UnixTimestamp::from_datetime(end_dt);
 
-    let (latest_block, memoized_latest_ts) = bounds_memo
-        .get_or_fetch_latest_block(fetch_latest_block_number)
-        .await?;
+    let (latest_block, memoized_latest_ts) = if eager_head_ts {
+        // Fetch the head's full `(block, ts)` pair so the cold-memo
+        // skip-insert branch below sees a known `latest_ts` and can
+        // confirm fully-historical days are safe to persist. The
+        // memo is shared with `block_range_for_timestamps_with`, so
+        // a head fetched here amortizes there too.
+        let (latest_block, latest_ts) = bounds_memo
+            .get_or_fetch_head(|| async {
+                let latest_block = fetch_latest_block_number().await?;
+                let latest_ts = fetch_ts(latest_block).await?;
+                Ok((latest_block, latest_ts))
+            })
+            .await?;
+        (latest_block, Some(latest_ts))
+    } else {
+        bounds_memo
+            .get_or_fetch_latest_block(fetch_latest_block_number)
+            .await?
+    };
 
     info!(
         chain = %chain,
@@ -1112,6 +1189,52 @@ mod tests {
         assert!(
             matches!(err, BlockWindowError::InvalidTimestampRange { .. }),
             "expected InvalidTimestampRange, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_disk_cache_opts_into_eager_head_ts() {
+        // Wiring check for #18: the `with_disk_cache` constructor must
+        // set `eager_head_ts=true` so disk-cache consumers actually get
+        // the persistence the constructor's name promises. The
+        // wiring-level test
+        // `daily_window_eager_head_ts_caches_historical_date` proves
+        // what the flag *does*; this test proves the constructor
+        // *sets* it.
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let cache_path = temp_dir.path().join("cache.json");
+        let calc = BlockWindowCalculator::with_disk_cache(dummy_provider(), &cache_path).unwrap();
+        assert!(
+            calc.eager_head_ts,
+            "with_disk_cache must opt into the eager head-ts fetch path"
+        );
+
+        // Conservative default everywhere else: a hand-rolled
+        // construction via `new` keeps the cold-memo skip-insert
+        // behavior, even when the supplied backend is a DiskCache. The
+        // `new` constructor is the documented escape hatch for
+        // consumers who want disk persistence but cannot afford the
+        // transient-tip failure surface of the eager fetch.
+        let cache = crate::blocks::cache::DiskCache::new(&cache_path)
+            .validate()
+            .unwrap();
+        let calc_new = BlockWindowCalculator::new(dummy_provider(), Box::new(cache));
+        assert!(
+            !calc_new.eager_head_ts,
+            "`new` must preserve the conservative default — only the named \
+             `with_disk_cache` constructor opts into eager head-ts"
+        );
+
+        let calc_mem = BlockWindowCalculator::with_memory_cache(dummy_provider());
+        assert!(
+            !calc_mem.eager_head_ts,
+            "`with_memory_cache` keeps the conservative default"
+        );
+
+        let calc_none = BlockWindowCalculator::without_cache(dummy_provider());
+        assert!(
+            !calc_none.eager_head_ts,
+            "`without_cache` keeps the conservative default"
         );
     }
 
@@ -2032,6 +2155,7 @@ mod tests {
             let w1 = get_daily_window_with(
                 &bounds_memo,
                 &cache,
+                false,
                 NamedChain::Arbitrum,
                 date,
                 counting_fetch_ts(timestamps.clone(), log.clone()),
@@ -2044,6 +2168,7 @@ mod tests {
             let w2 = get_daily_window_with(
                 &bounds_memo,
                 &cache,
+                false,
                 NamedChain::Arbitrum,
                 date,
                 counting_fetch_ts(timestamps, log.clone()),
@@ -2096,6 +2221,7 @@ mod tests {
             let w = get_daily_window_with(
                 &bounds_memo,
                 &cache,
+                false,
                 NamedChain::Arbitrum,
                 date,
                 counting_fetch_ts(timestamps, log.clone()),
@@ -2143,6 +2269,7 @@ mod tests {
             let w = get_daily_window_with(
                 &bounds_memo,
                 &cache,
+                false,
                 NamedChain::Arbitrum,
                 date,
                 counting_fetch_ts(timestamps, log.clone()),
@@ -2253,6 +2380,7 @@ mod tests {
             let window = get_daily_window_with(
                 &bounds_memo,
                 &cache,
+                false,
                 NamedChain::Arbitrum,
                 date,
                 fetch_ts_failing_at(timestamps, latest),
@@ -2324,6 +2452,7 @@ mod tests {
             let window = get_daily_window_with(
                 &bounds_memo,
                 &cache,
+                false,
                 NamedChain::Arbitrum,
                 date,
                 fetch_ts_unreachable(),
@@ -2398,6 +2527,7 @@ mod tests {
             let window = get_daily_window_with(
                 &bounds_memo,
                 &cache,
+                false,
                 NamedChain::Arbitrum,
                 date,
                 counting_fetch_ts(timestamps, log.clone()),
@@ -2455,6 +2585,7 @@ mod tests {
             let window = get_daily_window_with(
                 &bounds_memo,
                 &cache,
+                false,
                 NamedChain::Arbitrum,
                 date,
                 counting_fetch_ts(timestamps, log.clone()),
@@ -2519,6 +2650,7 @@ mod tests {
             let window = get_daily_window_with(
                 &bounds_memo,
                 &cache,
+                false,
                 NamedChain::Arbitrum,
                 date,
                 counting_fetch_ts(timestamps, log.clone()),
@@ -2586,6 +2718,7 @@ mod tests {
             let window = get_daily_window_with(
                 &bounds_memo,
                 &cache,
+                false,
                 NamedChain::Arbitrum,
                 date,
                 counting_fetch_ts(timestamps, log.clone()),
@@ -2611,6 +2744,169 @@ mod tests {
             assert_eq!(
                 stats.skip_inserts, 1,
                 "fence-post tip-touching skip must still increment skip_inserts"
+            );
+        }
+
+        #[tokio::test]
+        async fn daily_window_eager_head_ts_caches_historical_date() {
+            // Regression test for the failure scenario in #18: a
+            // `BlockWindowCalculator` constructed via `with_disk_cache`
+            // is asked for a fully-historical date from a cold memo
+            // (no prior `block_range_for_timestamps` call). Pre-fix
+            // (`eager_head_ts=false`), `get_or_fetch_latest_block`
+            // returned only the block number, leaving `latest_ts =
+            // None`, and the conservative skip-insert branch always
+            // fired — so the disk cache file stayed empty across
+            // restarts for daily-window-only consumers.
+            //
+            // Post-fix (`eager_head_ts=true`), the head's full `(block,
+            // ts)` pair is fetched, `latest_ts` is known to be strictly
+            // past `end_ts_exclusive`, and the window is persisted.
+            //
+            // 2025-01-01 UTC: end_ts_exclusive=1_735_776_000. Head ts
+            // 1_735_776_100 sits just past the day — fully historical.
+            let timestamps = vec![
+                1_735_689_500, // block 0 — before the day
+                1_735_689_700, // block 1 — first block on the day
+                1_735_745_000, // block 2 — mid-day
+                1_735_775_000, // block 3 — last block on the day
+                1_735_776_100, // block 4 — head, just past the day
+            ];
+            let latest: BlockNumber = 4;
+            let bounds_memo = ChainBoundsMemo::new(DEFAULT_HEAD_TTL);
+            let cache = crate::blocks::cache::MemoryCache::new();
+            let date = NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
+
+            let log = Arc::new(StdMutex::new(Vec::<BlockNumber>::new()));
+            let head_counter = Arc::new(AtomicUsize::new(0));
+
+            let window = get_daily_window_with(
+                &bounds_memo,
+                &cache,
+                true,
+                NamedChain::Arbitrum,
+                date,
+                counting_fetch_ts(timestamps, log.clone()),
+                counting_fetch_head(latest, head_counter.clone()),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!((window.start_block, window.end_block), (1, 3));
+            let stats = cache.stats().await;
+            assert_eq!(
+                stats.entries, 1,
+                "eager_head_ts=true on a fully-historical date must persist \
+                 the window — this is the #18 regression test. Without this, \
+                 `with_disk_cache` consumers that only call `get_daily_window` \
+                 see an empty cache file across restarts."
+            );
+            assert_eq!(
+                stats.skip_inserts, 0,
+                "historical-day cache insert must succeed under eager_head_ts"
+            );
+            assert_eq!(
+                head_counter.load(Ordering::SeqCst),
+                1,
+                "eth_blockNumber must fire exactly once on cold memo"
+            );
+        }
+
+        #[tokio::test]
+        async fn daily_window_eager_head_ts_still_skips_tip_touching() {
+            // Even with the eager head fetch, a day whose `end_ts_exclusive`
+            // extends past `latest_ts` must still skip the cache insert.
+            // The eager flag only fixes the cold-memo case where
+            // `latest_ts` was unknown; it does not change the tip-touching
+            // gate. Head ts=1_735_750_000 lands inside the requested day.
+            let timestamps = vec![
+                1_735_689_500, // block 0 — before the day
+                1_735_689_700, // block 1 — first block on the day
+                1_735_720_000, // block 2 — mid-day
+                1_735_745_000, // block 3 — mid-day
+                1_735_750_000, // block 4 — head, still inside the day
+            ];
+            let latest: BlockNumber = 4;
+            let bounds_memo = ChainBoundsMemo::new(DEFAULT_HEAD_TTL);
+            let cache = crate::blocks::cache::MemoryCache::new();
+            let date = NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
+
+            let log = Arc::new(StdMutex::new(Vec::<BlockNumber>::new()));
+            let head_counter = Arc::new(AtomicUsize::new(0));
+
+            let window = get_daily_window_with(
+                &bounds_memo,
+                &cache,
+                true,
+                NamedChain::Arbitrum,
+                date,
+                counting_fetch_ts(timestamps, log.clone()),
+                counting_fetch_head(latest, head_counter.clone()),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!((window.start_block, window.end_block), (1, 4));
+            let stats = cache.stats().await;
+            assert_eq!(
+                stats.entries, 0,
+                "eager_head_ts=true must not weaken the tip-touching gate — \
+                 a day whose end extends past the head still depends on \
+                 future chain state and must not be persisted"
+            );
+            assert_eq!(stats.skip_inserts, 1);
+        }
+
+        #[tokio::test]
+        async fn daily_window_eager_head_ts_propagates_transient_head_failure() {
+            // Documents the trade-off accepted in #18: the
+            // `eager_head_ts=true` path reintroduces the transient-tip
+            // failure surface that the cold-memo `false` path is
+            // designed to avoid. A one-block reorg or free-tier
+            // provider cache lag that orphans the just-reported head
+            // between `eth_blockNumber` and `eth_getBlockByNumber(head)`
+            // surfaces as an error to the caller — even when the date
+            // is interior and the binary search would never need the
+            // head's timestamp operationally.
+            //
+            // The sibling test `daily_window_survives_transient_head_ts_failure`
+            // proves the `false` path swallows this exact failure on
+            // historical dates; this test proves the `true` path does
+            // not. Consumers that need disk persistence accept the
+            // failure surface in exchange — see #18 and
+            // `BlockWindowCalculator::with_disk_cache`'s rustdoc.
+            let timestamps = vec![
+                1_736_899_100,
+                1_736_899_300,
+                1_736_950_000,
+                1_736_990_000,
+                1_736_995_000,
+            ];
+            let latest: BlockNumber = 4;
+            let bounds_memo = ChainBoundsMemo::new(DEFAULT_HEAD_TTL);
+            let cache = crate::blocks::cache::MemoryCache::new();
+            let date = NaiveDate::from_ymd_opt(2025, 1, 15).unwrap();
+
+            let head_counter = Arc::new(AtomicUsize::new(0));
+
+            let err = get_daily_window_with(
+                &bounds_memo,
+                &cache,
+                true,
+                NamedChain::Arbitrum,
+                date,
+                fetch_ts_failing_at(timestamps, latest),
+                counting_fetch_head(latest, head_counter.clone()),
+            )
+            .await
+            .expect_err(
+                "eager_head_ts=true must propagate transient head-ts \
+                 fetch errors — the cold-memo `false` path is the only \
+                 one that hides them",
+            );
+            assert!(
+                matches!(err, BlockWindowError::Rpc(RpcError::BlockNotFound { .. })),
+                "expected BlockNotFound from the failing head probe, got: {err:?}"
             );
         }
     }

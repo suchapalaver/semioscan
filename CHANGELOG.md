@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `BlockWindowCalculator::with_disk_cache` now actually persists windows
+  for `get_daily_window`-only consumers. Calculators built through this
+  constructor opt into an eager `eth_getBlockByNumber(head)` fetch so the
+  cold-memo daily-window path has `latest_ts` in hand and can confirm
+  historical days are safe to persist. Prior to this change a consumer
+  that paired `with_disk_cache` with daily-window-only access (e.g. a
+  daily reconciliation backfill) silently fell into the conservative
+  cache-skip-insert branch on every call — the disk cache file stayed
+  empty and every process restart re-paid the full binary search per
+  date. The other constructors (`new`, `with_memory_cache`,
+  `without_cache`) preserve the conservative default; consumers that
+  need disk persistence without the eager fetch can build a `DiskCache`
+  by hand and pass it through `new`. Closes #18.
+
 ## [0.14.0] - 2026-05-24
 
 ### Breaking Changes
