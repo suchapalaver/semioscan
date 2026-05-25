@@ -15,12 +15,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `LogScanner`, so they exposed dead surface area that diverged from
   the scanner's actual iteration (the scanner's loop terminates
   correctly when `end_block == u64::MAX`; the iterator did not).
-  Consumers that were slicing block ranges directly should fold the
-  arithmetic into their own loop (`current.saturating_add(chunk_size
-  - 1).min(end)` per chunk, advancing via `to_block.checked_add(1)`
-  so the loop breaks when the chunk ends at `u64::MAX`) or reach for
-  `LogScanner` / `fetch_logs_chunked` / `EventScanner` to fetch logs
-  in chunks. Closes #36.
+  Consumers that were using `ChunkIterator` to fetch logs in chunks
+  should switch to `LogScanner` (or its wrappers `fetch_logs_chunked`
+  / `EventScanner`), which share the canonical chunking loop, apply
+  per-chain rate limits, and let the caller pick a per-chunk error
+  policy. Consumers that genuinely need only the boundary arithmetic
+  (no log fetch) can fold it into their own loop
+  (`current.saturating_add(chunk_size - 1).min(end)` per chunk,
+  advancing via `to_block.checked_add(1)` so the loop breaks when
+  the chunk ends at `u64::MAX`). Closes #36.
 
 ### Fixed
 
