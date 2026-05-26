@@ -14,7 +14,11 @@
 pub mod balance;
 mod calculator;
 mod decimal_precision;
+mod failure;
 mod gas_calculation;
+mod gas_extractor;
+mod transfer_log_scanner;
+mod tx_receipt_enricher;
 mod types;
 mod utils;
 
