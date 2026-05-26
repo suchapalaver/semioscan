@@ -369,6 +369,30 @@ let provider = create_ws_provider(
 ).await?;
 ```
 
+`ProviderConfig`'s rate-limit axes apply to WebSocket providers the same
+way they do to HTTP providers: `with_rate_limit(rps)` installs a
+per-second budget, `with_min_delay(d)` installs a minimum gap between
+consecutive requests, and if both are set the rate-limit axis wins with
+a `tracing::warn!` at construction. The example below paces requests at
+least 250 ms apart against a strict WebSocket upstream:
+
+```rust
+use semioscan::{create_ws_provider, ProviderConfig};
+use std::time::Duration;
+
+let provider = create_ws_provider(
+    ProviderConfig::new("wss://eth-mainnet.ws.alchemyapi.io/v2/YOUR_KEY")
+        .with_min_delay(Duration::from_millis(250))
+).await?;
+```
+
+`ProviderConfig::with_timeout(...)` is **not honored** for WebSocket
+providers — `alloy_provider::WsConnect` does not expose a per-request
+timeout knob — so a timeout set on a config handed to
+`create_ws_provider` is dropped at construction and a `tracing::warn!`
+fires. Wrap WebSocket calls at the application layer if you need a
+request-level timeout.
+
 ### Real-Time Event Streaming
 
 ```rust
