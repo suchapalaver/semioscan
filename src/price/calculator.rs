@@ -3,30 +3,24 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use alloy_chains::NamedChain;
-use alloy_erc20::LazyToken;
-use alloy_primitives::{Address, BlockNumber, B256, U256};
+use alloy_primitives::{Address, BlockNumber, B256};
 use alloy_provider::Provider;
-use alloy_rpc_types::Filter;
-use futures::future::join_all;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use tracing::{error, info, warn};
 
 use crate::config::SemioscanConfig;
 use crate::errors::PriceCalculationError;
+use crate::price::aggregator::PriceAggregator;
 use crate::price::cache::PriceCache;
-use crate::price::{PriceSource, PriceSourceError, SwapData};
-use crate::scan::LogScanner;
-use crate::{NormalizedAmount, TokenAmount, TokenDecimals, TokenPrice, TransactionCount, UsdValue};
+use crate::price::decimals::{TokenDecimalsCache, TokenMetadataProvider};
+use crate::price::extractor::extract_swaps;
+use crate::price::normalize::{involves_pair, normalize_against_pair, normalize_swap};
+use crate::price::scanner::SwapLogScanner;
+use crate::price::{PriceSource, SwapData};
+use crate::{NormalizedAmount, TokenDecimals, TokenPrice, TransactionCount, UsdValue};
 
-// Internal type for swap data processing
-struct SwapAmounts {
-    token_amount: NormalizedAmount,
-    usdc_amount: UsdValue,
-}
-
-// Price calculation result
+/// Aggregate price totals for a single token over a block range.
 #[derive(Debug, Clone, Serialize)]
 pub struct TokenPriceResult {
     pub token_address: Address,
@@ -56,7 +50,7 @@ impl TokenPriceResult {
         }
     }
 
-    fn add_swap(&mut self, token_amount: f64, usdc_amount: f64) {
+    pub(crate) fn add_swap(&mut self, token_amount: f64, usdc_amount: f64) {
         self.total_token_amount += NormalizedAmount::new(token_amount);
         self.total_usdc_amount += UsdValue::new(usdc_amount);
         self.transaction_count += TransactionCount::new(1);
@@ -172,7 +166,7 @@ pub struct PriceCalculator<P> {
     price_source: Box<dyn PriceSource>,
     usdc_address: Address,
     chain: NamedChain,
-    token_decimals_cache: HashMap<Address, TokenDecimals>,
+    decimals_cache: TokenDecimalsCache,
     price_cache: Mutex<PriceCache>,
     config: SemioscanConfig,
 }
@@ -226,134 +220,32 @@ impl<P: Provider + Clone> PriceCalculator<P> {
             price_source,
             usdc_address,
             chain,
-            token_decimals_cache: HashMap::new(),
-            price_cache: Default::default(),
+            decimals_cache: TokenDecimalsCache::new(),
+            price_cache: Mutex::new(PriceCache::default()),
             config,
         }
     }
 
-    async fn get_token_decimals(
-        &mut self,
-        token_address: Address,
-    ) -> Result<TokenDecimals, PriceCalculationError> {
-        if let Some(&decimals) = self.token_decimals_cache.get(&token_address) {
-            return Ok(decimals);
-        }
-
-        let token_contract = LazyToken::new(token_address, self.provider.clone());
-        let decimals_raw = token_contract
-            .decimals()
-            .await
-            .map_err(|e| PriceCalculationError::metadata_fetch_failed(token_address, e))?;
-        let decimals = TokenDecimals::new(*decimals_raw);
-        self.token_decimals_cache.insert(token_address, decimals);
-
-        Ok(decimals)
-    }
-
-    /// Batch fetch token decimals for multiple addresses in parallel.
+    /// Scan, extract, and aggregate swaps for `[gap_start, gap_end]`.
     ///
-    /// This method fetches decimals for all provided token addresses concurrently,
-    /// which significantly reduces RPC latency when processing many tokens.
-    ///
-    /// When combined with Alloy's `CallBatchLayer`, these parallel calls are
-    /// automatically batched into a single Multicall3 RPC request, reducing
-    /// network overhead even further.
-    ///
-    /// Tokens that are already cached are skipped. Tokens that fail to fetch
-    /// are logged as warnings but don't cause the entire batch to fail.
-    async fn batch_fetch_token_decimals(&mut self, token_addresses: &[Address]) {
-        // Filter out already-cached addresses
-        let uncached: Vec<Address> = token_addresses
-            .iter()
-            .filter(|addr| !self.token_decimals_cache.contains_key(*addr))
-            .copied()
-            .collect();
-
-        if uncached.is_empty() {
-            return;
-        }
-
-        info!(
-            count = uncached.len(),
-            "Batch fetching token decimals for uncached tokens"
-        );
-
-        // Create futures for all uncached token fetches
-        let fetch_futures: Vec<_> = uncached
-            .iter()
-            .map(|&addr| {
-                let provider = self.provider.clone();
-                async move {
-                    let token_contract = LazyToken::new(addr, provider);
-                    let result = token_contract.decimals().await.copied();
-                    (addr, result)
-                }
-            })
-            .collect();
-
-        // Execute all fetches in parallel
-        // When CallBatchLayer is enabled, these will be automatically batched
-        let results = join_all(fetch_futures).await;
-
-        // Process results and update cache
-        for (addr, result) in results {
-            match result {
-                Ok(decimals_raw) => {
-                    let decimals = TokenDecimals::new(decimals_raw);
-                    self.token_decimals_cache.insert(addr, decimals);
-                }
-                Err(e) => {
-                    warn!(
-                        token = ?addr,
-                        error = ?e,
-                        "Failed to fetch decimals for token, will retry on demand"
-                    );
-                }
-            }
-        }
-    }
-
-    fn normalize_amount(&self, amount: U256, decimals: TokenDecimals) -> NormalizedAmount {
-        TokenAmount::new(amount).normalize(decimals)
-    }
-
-    /// Process a single gap by fetching logs with automatic chunking and rate limiting
-    ///
-    /// Scans the block range for swap events, processes each event to extract price data,
-    /// and accumulates results for the token.
-    ///
-    /// # Performance Optimization
-    ///
-    /// This method uses a two-pass approach to enable batch RPC calls:
-    /// 1. First pass: Extract all swap data from logs and collect unique token addresses
-    /// 2. Batch fetch all token decimals in parallel (benefits from `CallBatchLayer`)
-    /// 3. Second pass: Process swaps using cached decimals
-    ///
-    /// When the provider is constructed with `CallBatchLayer`, the parallel decimals
-    /// fetches are automatically batched into a single Multicall3 RPC request.
+    /// Uses [`SwapLogScanner`] to fetch logs, [`extract_swaps`] to turn them
+    /// into [`SwapData`], [`TokenMetadataProvider::ensure_decimals`] to bulk
+    /// prime the decimals cache (one Multicall3 round-trip under
+    /// `CallBatchLayer`), then folds normalised target/USDC pairs through a
+    /// [`PriceAggregator`].
     async fn process_gap_for_price(
         &mut self,
         token_address: Address,
         gap_start: BlockNumber,
         gap_end: BlockNumber,
     ) -> Result<TokenPriceResult, PriceCalculationError> {
-        let mut gap_result = TokenPriceResult::new(token_address);
-        let event_topics = self.price_source.event_topics();
-
-        let scanner = LogScanner::new(&self.provider, self.config.clone());
-
-        let filter = Filter::new()
-            .address(self.price_source.router_address())
-            .event_signature(event_topics.clone());
-
-        // Continue-on-error: missing a chunk reduces coverage but does not
-        // fail the price calculation.
-        let logs = scanner
-            .scan::<PriceCalculationError, _>(self.chain, filter, gap_start, gap_end, |_, _, _| {
-                None
-            })
-            .await?;
+        let scanner = SwapLogScanner::new(
+            &self.provider,
+            self.chain,
+            self.price_source.as_ref(),
+            self.config.clone(),
+        );
+        let logs = scanner.scan(gap_start, gap_end).await?;
 
         info!(
             logs_count = logs.len(),
@@ -362,108 +254,74 @@ impl<P: Provider + Clone> PriceCalculator<P> {
             "Fetched logs for gap"
         );
 
-        // First pass: Extract all swap data and collect unique token addresses
-        let mut swaps = Vec::new();
-        let mut token_addresses = HashSet::new();
+        let extracted = extract_swaps(self.price_source.as_ref(), &logs);
 
-        for log in &logs {
-            match self.price_source.extract_swap_from_log(log) {
-                Ok(Some(swap_data)) => {
-                    if !self.price_source.should_include_swap(&swap_data) {
-                        continue;
-                    }
+        // Only swaps pairing the target token against USDC contribute to the
+        // aggregate. Decimals for any other token are irrelevant, so the batch
+        // fetch is scoped to exactly those two addresses (a single Multicall3
+        // round-trip under `CallBatchLayer`).
+        let relevant: Vec<&SwapData> = extracted
+            .swaps
+            .iter()
+            .filter(|swap| involves_pair(swap, token_address, self.usdc_address))
+            .collect();
 
-                    // Check if this swap involves our target token
-                    let is_relevant = (swap_data.token_in == token_address
-                        && swap_data.token_out == self.usdc_address)
-                        || (swap_data.token_in == self.usdc_address
-                            && swap_data.token_out == token_address);
-
-                    if is_relevant {
-                        // Collect token addresses for batch fetching
-                        token_addresses.insert(swap_data.token_in);
-                        token_addresses.insert(swap_data.token_out);
-                        swaps.push(swap_data);
-                    }
-                }
-                Ok(None) => {
-                    // Log is not a relevant swap event
-                }
-                Err(e @ PriceSourceError::DecodeError(_)) => {
-                    error!(error = ?e, "Failed to decode log");
-                }
-                Err(
-                    e @ (PriceSourceError::EmptyTokenArrays
-                    | PriceSourceError::ArrayLengthMismatch { .. }
-                    | PriceSourceError::InvalidSwapData { .. }),
-                ) => {
-                    error!(error = ?e, "Invalid swap data in log");
-                }
-            }
+        let mut aggregator = PriceAggregator::new(token_address);
+        if relevant.is_empty() {
+            return Ok(aggregator.finish());
         }
 
-        // Batch fetch all token decimals in parallel
-        // When CallBatchLayer is enabled, these parallel calls are automatically
-        // batched into a single Multicall3 RPC request
-        let addresses: Vec<Address> = token_addresses.into_iter().collect();
-        self.batch_fetch_token_decimals(&addresses).await;
+        let metadata = TokenMetadataProvider::new(&self.provider);
+        metadata
+            .ensure_decimals(
+                &mut self.decimals_cache,
+                &[token_address, self.usdc_address],
+            )
+            .await;
 
-        // Second pass: Process swaps using cached decimals
-        for swap_data in swaps {
-            match self.process_swap_data(&swap_data, token_address).await {
-                Ok(Some(amounts)) => {
-                    gap_result
-                        .add_swap(amounts.token_amount.as_f64(), amounts.usdc_amount.as_f64());
-                }
-                Ok(None) => {
-                    // Not relevant for our token (shouldn't happen since we filtered above)
-                }
+        for swap in relevant {
+            // A decimals fetch failure skips the swap rather than aborting the
+            // whole range, so one unreadable token can't void an entire scan.
+            let target_decimals = match metadata
+                .get_or_fetch(&mut self.decimals_cache, token_address)
+                .await
+            {
+                Ok(d) => d,
                 Err(e) => {
                     error!(error = ?e, "Error processing swap data");
+                    continue;
                 }
+            };
+            let usdc_decimals = match metadata
+                .get_or_fetch(&mut self.decimals_cache, self.usdc_address)
+                .await
+            {
+                Ok(d) => d,
+                Err(e) => {
+                    error!(error = ?e, "Error processing swap data");
+                    continue;
+                }
+            };
+
+            if let Some(amounts) = normalize_against_pair(
+                swap,
+                token_address,
+                self.usdc_address,
+                target_decimals,
+                usdc_decimals,
+            ) {
+                aggregator.add(&amounts);
             }
         }
 
-        Ok(gap_result)
+        Ok(aggregator.finish())
     }
 
-    async fn process_swap_data(
-        &mut self,
-        swap: &crate::price::SwapData,
-        token_address: Address,
-    ) -> Result<Option<SwapAmounts>, PriceCalculationError> {
-        // Check if this swap involves our target token being sold for USDC
-        if swap.token_in == token_address && swap.token_out == self.usdc_address {
-            let token_decimals = self.get_token_decimals(token_address).await?;
-            let usdc_decimals = self.get_token_decimals(self.usdc_address).await?;
-
-            let token_amount = self.normalize_amount(swap.token_in_amount, token_decimals);
-            let usdc_amount = self.normalize_amount(swap.token_out_amount, usdc_decimals);
-
-            return Ok(Some(SwapAmounts {
-                token_amount,
-                usdc_amount: UsdValue::new(usdc_amount.as_f64()),
-            }));
-        }
-
-        // Check if this swap involves USDC being sold for our target token (reverse direction)
-        // This provides price information too: if someone buys our token with USDC
-        if swap.token_in == self.usdc_address && swap.token_out == token_address {
-            let token_decimals = self.get_token_decimals(token_address).await?;
-            let usdc_decimals = self.get_token_decimals(self.usdc_address).await?;
-
-            let token_amount = self.normalize_amount(swap.token_out_amount, token_decimals);
-            let usdc_amount = self.normalize_amount(swap.token_in_amount, usdc_decimals);
-
-            return Ok(Some(SwapAmounts {
-                token_amount,
-                usdc_amount: UsdValue::new(usdc_amount.as_f64()),
-            }));
-        }
-
-        Ok(None)
-    }
-
+    /// Calculate aggregated price totals for `token_address` between
+    /// `start_block` and `end_block`.
+    ///
+    /// Uses the internal range cache to skip already-scanned sub-ranges and
+    /// only fetches uncached gaps.
     pub async fn calculate_price_between_blocks(
         &mut self,
         token_address: Address,
@@ -584,25 +442,13 @@ impl<P: Provider + Clone> PriceCalculator<P> {
             "Extracting raw swaps"
         );
 
-        let event_topics = self.price_source.event_topics();
-
-        let scanner = LogScanner::new(&self.provider, self.config.clone());
-
-        let filter = Filter::new()
-            .address(self.price_source.router_address())
-            .event_signature(event_topics.clone());
-
-        // Continue-on-error: missing a chunk reduces coverage but does not
-        // fail the raw-swap extraction.
-        let logs = scanner
-            .scan::<PriceCalculationError, _>(
-                self.chain,
-                filter,
-                start_block,
-                end_block,
-                |_, _, _| None,
-            )
-            .await?;
+        let scanner = SwapLogScanner::new(
+            &self.provider,
+            self.chain,
+            self.price_source.as_ref(),
+            self.config.clone(),
+        );
+        let logs = scanner.scan(start_block, end_block).await?;
 
         info!(
             logs_count = logs.len(),
@@ -611,47 +457,22 @@ impl<P: Provider + Clone> PriceCalculator<P> {
             "Fetched logs for raw swap extraction"
         );
 
-        // First pass: Extract all swap data and collect unique token addresses
-        let mut swaps = Vec::new();
-        let mut token_addresses = HashSet::new();
+        let extracted = extract_swaps(self.price_source.as_ref(), &logs);
 
-        for log in &logs {
-            match self.price_source.extract_swap_from_log(log) {
-                Ok(Some(swap_data)) => {
-                    if !self.price_source.should_include_swap(&swap_data) {
-                        continue;
-                    }
+        let metadata = TokenMetadataProvider::new(&self.provider);
+        metadata
+            .ensure_decimals(
+                &mut self.decimals_cache,
+                &extracted.unique_token_addresses(),
+            )
+            .await;
 
-                    // Collect token addresses for batch fetching
-                    token_addresses.insert(swap_data.token_in);
-                    token_addresses.insert(swap_data.token_out);
-                    swaps.push(swap_data);
-                }
-                Ok(None) => {
-                    // Log is not a relevant swap event
-                }
-                Err(e @ PriceSourceError::DecodeError(_)) => {
-                    error!(error = ?e, "Failed to decode log");
-                }
-                Err(
-                    e @ (PriceSourceError::EmptyTokenArrays
-                    | PriceSourceError::ArrayLengthMismatch { .. }
-                    | PriceSourceError::InvalidSwapData { .. }),
-                ) => {
-                    error!(error = ?e, "Invalid swap data in log");
-                }
-            }
-        }
-
-        // Batch fetch all token decimals in parallel
-        let addresses: Vec<Address> = token_addresses.into_iter().collect();
-        self.batch_fetch_token_decimals(&addresses).await;
-
-        // Second pass: Create RawSwapResult with normalized amounts
-        let mut results = Vec::with_capacity(swaps.len());
-        for swap in swaps {
-            // Get decimals for both tokens
-            let token_in_decimals = match self.get_token_decimals(swap.token_in).await {
+        let mut results = Vec::with_capacity(extracted.swaps.len());
+        for swap in extracted.swaps {
+            let token_in_decimals = match metadata
+                .get_or_fetch(&mut self.decimals_cache, swap.token_in)
+                .await
+            {
                 Ok(d) => d,
                 Err(e) => {
                     warn!(token = ?swap.token_in, error = ?e, "Failed to get decimals for token_in, skipping swap");
@@ -659,7 +480,10 @@ impl<P: Provider + Clone> PriceCalculator<P> {
                 }
             };
 
-            let token_out_decimals = match self.get_token_decimals(swap.token_out).await {
+            let token_out_decimals = match metadata
+                .get_or_fetch(&mut self.decimals_cache, swap.token_out)
+                .await
+            {
                 Ok(d) => d,
                 Err(e) => {
                     warn!(token = ?swap.token_out, error = ?e, "Failed to get decimals for token_out, skipping swap");
@@ -667,17 +491,14 @@ impl<P: Provider + Clone> PriceCalculator<P> {
                 }
             };
 
-            let normalized_token_in =
-                self.normalize_amount(swap.token_in_amount, token_in_decimals);
-            let normalized_token_out =
-                self.normalize_amount(swap.token_out_amount, token_out_decimals);
+            let normalized = normalize_swap(&swap, token_in_decimals, token_out_decimals);
 
             results.push(RawSwapResult {
                 swap,
-                normalized_token_in_amount: normalized_token_in,
-                normalized_token_out_amount: normalized_token_out,
-                token_in_decimals,
-                token_out_decimals,
+                normalized_token_in_amount: normalized.token_in_amount,
+                normalized_token_out_amount: normalized.token_out_amount,
+                token_in_decimals: normalized.token_in_decimals,
+                token_out_decimals: normalized.token_out_decimals,
             });
         }
 
@@ -690,7 +511,7 @@ impl<P: Provider + Clone> PriceCalculator<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::address;
+    use alloy_primitives::{address, U256};
 
     #[test]
     fn test_add_swap_accumulates_amounts() {
@@ -715,7 +536,6 @@ mod tests {
         let token = address!("1111111111111111111111111111111111111111");
         let mut result = TokenPriceResult::new(token);
 
-        // Add swaps with known prices
         // Swap 1: 100 tokens for 200 USDC = $2.00 per token
         result.add_swap(100.0, 200.0);
         // Swap 2: 50 tokens for 150 USDC = $3.00 per token
@@ -741,7 +561,6 @@ mod tests {
         let mut result = TokenPriceResult::new(token);
 
         // Edge case: USDC amount but zero token amount
-        // This shouldn't happen in practice but we handle it gracefully
         result.add_swap(0.0, 100.0);
         assert_eq!(result.get_average_price(), TokenPrice::ZERO);
     }
@@ -757,12 +576,10 @@ mod tests {
         let mut result2 = TokenPriceResult::new(token);
         result2.add_swap(25.0, 50.0);
 
-        // Merge result2 into result1
         result1.merge(&result2);
 
-        // Check combined values
-        assert_eq!(result1.total_token_amount().as_f64(), 175.0); // 100 + 50 + 25
-        assert_eq!(result1.total_usdc_amount().as_f64(), 350.0); // 200 + 100 + 50
+        assert_eq!(result1.total_token_amount().as_f64(), 175.0);
+        assert_eq!(result1.total_usdc_amount().as_f64(), 350.0);
         assert_eq!(result1.transaction_count().as_usize(), 3);
     }
 
@@ -775,7 +592,6 @@ mod tests {
 
         let empty = TokenPriceResult::new(token);
 
-        // Merge empty result should not change values
         result.merge(&empty);
 
         assert_eq!(result.total_token_amount().as_f64(), 100.0);
@@ -803,7 +619,6 @@ mod tests {
         let token = address!("1111111111111111111111111111111111111111");
         let mut result = TokenPriceResult::new(token);
 
-        // Test with large amounts (billions of dollars)
         result.add_swap(1_000_000_000.0, 2_000_000_000.0);
         result.add_swap(500_000_000.0, 1_000_000_000.0);
 
@@ -817,7 +632,6 @@ mod tests {
         let token = address!("1111111111111111111111111111111111111111");
         let mut result = TokenPriceResult::new(token);
 
-        // Test with small fractional amounts
         result.add_swap(0.001, 0.002);
         result.add_swap(0.0005, 0.001);
 
@@ -828,15 +642,11 @@ mod tests {
 
     #[test]
     fn test_normalize_amount_standard_decimals() {
-        // Test normalize_amount logic directly without needing a provider
-        // This tests the business logic of decimal normalization
-
-        // Test USDC (6 decimals): 1,000,000 raw = 1.0 USDC
+        // Sanity check on the U256 -> f64 path independent of the calculator.
         let divisor = U256::from(10u64.pow(6));
         let normalized = f64::from(U256::from(1_000_000u64)) / f64::from(divisor);
         assert_eq!(normalized, 1.0);
 
-        // Test WETH (18 decimals): 1e18 raw = 1.0 ETH
         let divisor = U256::from(10u128.pow(18));
         let normalized = f64::from(U256::from(1_000_000_000_000_000_000u64)) / f64::from(divisor);
         assert_eq!(normalized, 1.0);
@@ -844,19 +654,14 @@ mod tests {
 
     #[test]
     fn test_normalize_amount_edge_cases() {
-        // Test normalize_amount logic without needing a provider
-
-        // Zero amount
         let divisor = U256::from(10u128.pow(18));
         let normalized = f64::from(U256::ZERO) / f64::from(divisor);
         assert_eq!(normalized, 0.0);
 
-        // Zero decimals (like some weird tokens)
-        let divisor = U256::from(10u64.pow(0)); // = 1
+        let divisor = U256::from(10u64.pow(0));
         let normalized = f64::from(U256::from(42u64)) / f64::from(divisor);
         assert_eq!(normalized, 42.0);
 
-        // 1 decimal
         let divisor = U256::from(10u64.pow(1));
         let normalized = f64::from(U256::from(100u64)) / f64::from(divisor);
         assert_eq!(normalized, 10.0);
@@ -866,7 +671,6 @@ mod tests {
     fn test_average_price_calculation() {
         let token = address!("1111111111111111111111111111111111111111");
 
-        // Manually set values to simulate swap processing
         let result = TokenPriceResult {
             token_address: token,
             total_token_amount: NormalizedAmount::new(100.0),
@@ -874,7 +678,6 @@ mod tests {
             transaction_count: TransactionCount::new(5),
         };
 
-        // Average price = 200.0 / 100.0 = 2.0 USDC per token
         assert_eq!(result.get_average_price().as_f64(), 2.0);
     }
 
@@ -888,12 +691,11 @@ mod tests {
             transaction_count: TransactionCount::new(10),
         };
 
-        // Average price ≈ 3.0
         let price = result.get_average_price();
         assert!(
             (price.as_f64() - 3.0).abs() < 0.01,
-            "Expected ~3.0, got {}",
-            price.as_f64()
+            "Expected ~3.0, got {price}",
+            price = price.as_f64()
         );
     }
 
@@ -903,7 +705,6 @@ mod tests {
 
         let mut total = TokenPriceResult::new(token);
 
-        // Merge three results
         let r1 = TokenPriceResult {
             token_address: token,
             total_token_amount: NormalizedAmount::new(10.0),
@@ -941,17 +742,16 @@ mod tests {
 
         let result = TokenPriceResult {
             token_address: token,
-            total_token_amount: NormalizedAmount::new(0.000001), // Very small amount
-            total_usdc_amount: UsdValue::new(0.00000123),        // Even smaller USDC amount
+            total_token_amount: NormalizedAmount::new(0.000001),
+            total_usdc_amount: UsdValue::new(0.00000123),
             transaction_count: TransactionCount::new(1),
         };
 
         let price = result.get_average_price();
-        // Price = 0.00000123 / 0.000001 = 1.23
         assert!(
             (price.as_f64() - 1.23).abs() < 0.001,
-            "Expected ~1.23, got {}",
-            price.as_f64()
+            "Expected ~1.23, got {price}",
+            price = price.as_f64()
         );
     }
 }
