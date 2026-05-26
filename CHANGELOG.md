@@ -45,6 +45,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The provider-layer pacing setters `ProviderConfig::with_min_delay` and
+  `ChainEndpoint::with_min_delay` now reject `Duration::ZERO` at the call
+  site instead of accepting it and panicking later when the pool
+  materialises its transport layer. Operators who built endpoints
+  directly — for example `ProviderPoolBuilder::add_endpoint(ChainEndpoint
+  ::new(chain, url).with_min_delay(min_delay))` with `min_delay` loaded
+  from a TOML/YAML field where `0` was a natural "no delay" sentinel —
+  previously saw their service panic inside `RateLimitLayer::with_min_delay`
+  at pool-build time, with the backtrace pointing at the pool builder
+  rather than at their `with_min_delay(...)` call. The two setters now
+  panic with a message naming the invalid axis, surfaced at the
+  operator's source location via `#[track_caller]`, and the rejection
+  contract matches the layer-level guard and the configuration-builder
+  surface fixed in the previous release. To express "no pacing" for a
+  provider or endpoint, leave `min_delay` unset (`None`) — passing
+  `Duration::ZERO` is no longer a way to silently fall back to "unset".
+  Closes #59.
 - The configuration builders now reject a zero-duration rate-limit delay
   at the call site instead of accepting it and panicking later when the
   pool materialises its transport layer. `SemioscanConfigBuilder::
