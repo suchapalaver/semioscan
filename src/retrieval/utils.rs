@@ -11,8 +11,7 @@ use std::str::FromStr;
 
 use crate::config::constants::stablecoins::BSC_BINANCE_PEG_USDC;
 use crate::errors::RetrievalError;
-
-use super::decimal_precision::DecimalPrecision;
+use crate::types::decimal_precision::DecimalPrecision;
 
 /// Get the decimal precision for a specific token on a specific chain.
 /// Native tokens (Address::ZERO) use 18 decimals.

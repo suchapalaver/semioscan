@@ -66,17 +66,27 @@
 //! }
 //! ```
 
+#[cfg(feature = "blocks")]
 mod blocks;
+#[cfg(feature = "events")]
 mod events;
+#[cfg(feature = "gas")]
 mod gas;
+#[cfg(feature = "price")]
 mod price;
+#[cfg(feature = "retrieval")]
 mod retrieval;
 mod rpc;
 
+#[cfg(feature = "blocks")]
 pub use blocks::BlockWindowError;
+#[cfg(feature = "events")]
 pub use events::EventProcessingError;
+#[cfg(feature = "gas")]
 pub use gas::GasCalculationError;
+#[cfg(feature = "price")]
 pub use price::PriceCalculationError;
+#[cfg(feature = "retrieval")]
 pub use retrieval::RetrievalError;
 pub use rpc::RpcError;
 
@@ -112,22 +122,27 @@ pub use rpc::RpcError;
 #[derive(Debug, thiserror::Error)]
 pub enum SemioscanError {
     /// Error from block window calculations.
+    #[cfg(feature = "blocks")]
     #[error("Block window error: {0}")]
     BlockWindow(#[from] BlockWindowError),
 
     /// Error from gas cost calculations.
+    #[cfg(feature = "gas")]
     #[error("Gas calculation error: {0}")]
     Gas(#[from] GasCalculationError),
 
     /// Error from price calculations.
+    #[cfg(feature = "price")]
     #[error("Price calculation error: {0}")]
     Price(#[from] PriceCalculationError),
 
     /// Error from event processing operations.
+    #[cfg(feature = "events")]
     #[error("Event processing error: {0}")]
     Events(#[from] EventProcessingError),
 
     /// Error from combined data retrieval operations.
+    #[cfg(feature = "retrieval")]
     #[error("Data retrieval error: {0}")]
     Retrieval(#[from] RetrievalError),
 }

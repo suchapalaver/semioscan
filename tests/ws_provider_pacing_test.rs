@@ -2,6 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#![cfg(feature = "ws")]
+
 //! Behaviour guard for issue #54: a `ProviderConfig` carrying either
 //! rate-limiting axis must produce a WebSocket provider that actually
 //! paces requests on the wire, not just at the type level.

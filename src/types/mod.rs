@@ -13,6 +13,7 @@
 
 pub mod cache;
 pub mod config;
+pub mod decimal_precision;
 pub mod fees;
 pub mod gas;
 pub mod tokens;

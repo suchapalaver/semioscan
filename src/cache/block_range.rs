@@ -252,16 +252,19 @@ where
     }
 
     /// Get the total number of cached entries
+    #[cfg_attr(not(feature = "gas"), allow(dead_code))]
     pub fn len(&self) -> usize {
         self.cache.len()
     }
 
     /// Check if the cache contains no entries
+    #[cfg_attr(not(feature = "gas"), allow(dead_code))]
     pub fn is_empty(&self) -> bool {
         self.cache.is_empty()
     }
 
     /// Clear all entries matching a predicate on the key
+    #[cfg_attr(not(feature = "gas"), allow(dead_code))]
     pub fn retain<F>(&mut self, mut predicate: F)
     where
         F: FnMut(&K, BlockNumber, BlockNumber) -> bool,

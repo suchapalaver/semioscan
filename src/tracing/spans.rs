@@ -19,14 +19,20 @@
 //! ```
 
 use alloy_chains::NamedChain;
-use alloy_primitives::{Address, BlockNumber, TxHash};
+use alloy_primitives::BlockNumber;
+#[cfg(any(feature = "gas", feature = "retrieval"))]
+use alloy_primitives::{Address, TxHash};
+#[cfg(feature = "blocks")]
 use chrono::NaiveDate;
-use tracing::{Level, Span};
+#[cfg(any(feature = "gas", feature = "retrieval"))]
+use tracing::Level;
+use tracing::Span;
 
 /// Create span for processing a single log entry for combined data extraction.
 ///
 /// Parent: process_block_range_for_combined_data span
 /// Children: RPC calls for transaction and receipt retrieval
+#[cfg(feature = "retrieval")]
 #[inline]
 pub(crate) fn process_log_for_combined_data(tx_hash: TxHash) -> Span {
     tracing::trace_span!("semioscan.process_log_for_combined_data", tx_hash = %tx_hash,)
@@ -36,6 +42,7 @@ pub(crate) fn process_log_for_combined_data(tx_hash: TxHash) -> Span {
 ///
 /// Parent: calculate_combined_data_with_adapter span
 /// Children: process_log_for_combined_data spans (one per log)
+#[cfg(feature = "retrieval")]
 #[inline]
 pub(crate) fn process_block_range_for_combined_data(
     chain: NamedChain,
@@ -62,6 +69,7 @@ pub(crate) fn process_block_range_for_combined_data(
 ///
 /// Parent: None (root span for this operation)
 /// Children: process_block_range_for_combined_data span
+#[cfg(feature = "retrieval")]
 #[inline]
 pub(crate) fn calculate_combined_data_with_adapter(
     chain: NamedChain,
@@ -87,6 +95,7 @@ pub(crate) fn calculate_combined_data_with_adapter(
 ///
 /// Parent: Gas calculator operation span
 /// Children: RPC calls for transaction and receipt retrieval
+#[cfg(feature = "gas")]
 #[inline]
 pub(crate) fn process_event_log(tx_hash: TxHash) -> Span {
     tracing::span!(
@@ -100,6 +109,7 @@ pub(crate) fn process_event_log(tx_hash: TxHash) -> Span {
 ///
 /// Parent: Block window calculation span
 /// Children: RPC call to get block
+#[cfg(feature = "blocks")]
 #[inline]
 pub(crate) fn get_block_timestamp(block_number: BlockNumber) -> Span {
     tracing::debug_span!("semioscan.get_block_timestamp", block_number = block_number,)
@@ -111,6 +121,7 @@ pub(crate) fn get_block_timestamp(block_number: BlockNumber) -> Span {
 ///
 /// Parent: None (root span for this operation)
 /// Children: get_block_timestamp spans (during binary search)
+#[cfg(feature = "blocks")]
 #[inline]
 pub(crate) fn get_daily_window(chain: NamedChain, date: NaiveDate) -> Span {
     tracing::info_span!(
@@ -124,6 +135,7 @@ pub(crate) fn get_daily_window(chain: NamedChain, date: NaiveDate) -> Span {
 ///
 /// Parent: None (root span for this operation)
 /// Children: get_block_timestamp spans (during binary search)
+#[cfg(feature = "blocks")]
 #[inline]
 pub(crate) fn block_range_for_timestamps(start_ts: u64, end_ts: u64) -> Span {
     tracing::info_span!(
@@ -137,6 +149,7 @@ pub(crate) fn block_range_for_timestamps(start_ts: u64, end_ts: u64) -> Span {
 ///
 /// Parent: calculate_gas_cost_with_adapter span
 /// Children: RPC calls for fetching logs and processing individual log entries
+#[cfg(feature = "gas")]
 #[inline]
 pub(crate) fn process_logs_in_range(
     event_type: crate::EventType,
@@ -166,6 +179,7 @@ pub(crate) fn process_logs_in_range(
 ///
 /// Parent: None (root span for this operation)
 /// Children: process_logs_in_range spans (one per gap)
+#[cfg(feature = "gas")]
 #[inline]
 pub(crate) fn calculate_gas_cost_with_adapter(
     event_type: crate::EventType,

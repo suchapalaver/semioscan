@@ -2,6 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#![cfg(feature = "provider")]
+
 //! Behaviour guard for issue #47: a provider pool built through
 //! `ProviderPoolBuilder::with_rpc_policy(&config)` must honour the policy's
 //! per-chain `rate_limit_delay`. Before the fix, the pool path read only

@@ -2,6 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#![cfg(feature = "provider")]
+
 //! Behaviour guard for the issue #45 regression: a `ProviderConfig` whose only
 //! rate-limiting axis is `min_delay` must produce a typed HTTP provider that
 //! actually throttles requests.
