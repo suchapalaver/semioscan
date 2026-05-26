@@ -10,12 +10,10 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::debug;
 
-use super::{
-    types::{AccessSequence, TimestampMillis},
-    BlockWindowCache, CacheKey, CacheStats,
-};
+use super::{BlockWindowCache, CacheKey, CacheStats};
 use crate::blocks::window::DailyBlockWindow;
 use crate::errors::BlockWindowError;
+use crate::types::cache::{AccessSequence, TimestampMillis};
 
 /// Entry in the memory cache with metadata
 #[derive(Debug, Clone)]

@@ -10,13 +10,11 @@
 //! - Configuration values (block ranges, rate limits)
 //! - Fee calculations
 //! - Cache metadata (timestamps, access sequences)
-//! - Price source errors (type-safe error handling without type erasure)
 
 pub mod cache;
 pub mod config;
 pub mod fees;
 pub mod gas;
-pub mod price;
 pub mod tokens;
 pub mod wei;
 

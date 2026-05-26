@@ -2,10 +2,10 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Strong types for price source operations.
+//! Error type for price source implementations.
 //!
-//! This module provides type-safe error handling for price source implementations,
-//! eliminating type erasure by preserving original error types rather than converting to strings.
+//! Provides type-safe error handling for `PriceSource` implementations,
+//! preserving original error types rather than converting to strings.
 
 /// Errors that can occur when extracting price data from logs.
 ///
