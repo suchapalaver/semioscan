@@ -88,8 +88,18 @@ impl RpcConfig {
     }
 
     /// Set the minimum spacing between RPC calls for this chain.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `delay` is [`Duration::ZERO`]. The token-bucket layer this
+    /// value ultimately reaches cannot represent a zero period; see
+    /// [`SemioscanConfigBuilder::rate_limit_delay`](crate::SemioscanConfigBuilder::rate_limit_delay).
+    /// To express "no rate limit", leave `rate_limit_delay` unset (`None`)
+    /// rather than passing [`Duration::ZERO`].
     #[must_use]
+    #[track_caller]
     pub fn with_rate_limit_delay(mut self, delay: Duration) -> Self {
+        super::assert_nonzero_rate_limit_delay(delay);
         self.rate_limit_delay = Some(delay);
         self
     }

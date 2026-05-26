@@ -45,6 +45,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The configuration builders now reject a zero-duration rate-limit delay
+  at the call site instead of accepting it and panicking later when the
+  pool materialises its transport layer. `SemioscanConfigBuilder::
+  rate_limit_delay`, `chain_rate_limit`, `SemioscanConfig::
+  set_chain_override` (when given a `ChainConfig` whose
+  `rate_limit_delay` is `Some(Duration::ZERO)`), the builder's
+  `chain_config` convenience, and `RpcConfig::with_rate_limit_delay`
+  all now panic with a message naming the invalid axis. Previously an
+  operator who loaded the value from a TOML/YAML field where `0` was a
+  natural "no delay" sentinel had two existing tests
+  (`test_zero_duration_delay`, `prop_zero_delay_is_valid`) telling them
+  the configuration round-tripped cleanly, only to see their service
+  panic at pool-build time inside `RateLimitLayer::with_min_delay`. The
+  config-builder contract now matches the layer contract introduced in
+  the previous fix, and `#[track_caller]` carries the panic location to
+  the operator's setter call rather than the assert inside the helper.
+  The two tests have been replaced with `#[should_panic]` versions that
+  pin the rejection, and the property-test ranges that previously
+  included `0` now start at `1`. To express "no rate limit" for a chain,
+  leave `rate_limit_delay` unset (`None`) — passing `Duration::ZERO` is
+  no longer a way to silently fall back to "unset". Closes #57.
 - `RateLimitLayer::new`, `::per_second`, and `::with_min_delay` now panic
   at construction when given zero arguments, instead of silently building
   a degenerate layer. Previously `RateLimitLayer::per_second(0)` produced

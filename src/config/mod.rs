@@ -48,6 +48,22 @@ use crate::types::config::MaxBlockRange;
 pub mod constants;
 pub mod policy;
 
+/// Panic with a uniform message if a rate-limit delay is [`Duration::ZERO`].
+///
+/// Every public setter that stores a rate-limit delay on
+/// [`SemioscanConfig`], [`ChainConfig`], or [`policy::RpcConfig`] funnels
+/// through this check so the rejection contract is identical across the
+/// builder surface and matches the layer-level guard in
+/// [`RateLimitLayer::new`](crate::transport::RateLimitLayer::new).
+#[track_caller]
+fn assert_nonzero_rate_limit_delay(delay: Duration) {
+    assert!(
+        !delay.is_zero(),
+        "rate_limit_delay must be > 0; got Duration::ZERO. \
+         To disable pacing, leave rate_limit_delay unset (None) instead of passing Duration::ZERO."
+    );
+}
+
 /// Configuration for semioscan operations
 ///
 /// Controls RPC behavior including block range limits, rate limiting, and timeouts.
@@ -268,6 +284,11 @@ impl SemioscanConfig {
 
     /// Set chain-specific override
     ///
+    /// # Panics
+    ///
+    /// Panics if `config.rate_limit_delay` is `Some(Duration::ZERO)`. See
+    /// [`SemioscanConfigBuilder::rate_limit_delay`] for the reasoning.
+    ///
     /// # Example
     ///
     /// ```rust
@@ -286,7 +307,11 @@ impl SemioscanConfig {
     ///     },
     /// );
     /// ```
+    #[track_caller]
     pub fn set_chain_override(&mut self, chain: NamedChain, config: ChainConfig) {
+        if let Some(delay) = config.rate_limit_delay {
+            assert_nonzero_rate_limit_delay(delay);
+        }
         self.chain_overrides.insert(chain, config);
     }
 }
@@ -376,6 +401,15 @@ impl SemioscanConfigBuilder {
 
     /// Set global rate limit delay
     ///
+    /// # Panics
+    ///
+    /// Panics if `delay` is [`Duration::ZERO`]. The token-bucket layer this
+    /// value ultimately reaches cannot represent a zero period: it would
+    /// either stall every request indefinitely or taint refill math with
+    /// `NaN`. To express "no rate limit", leave `rate_limit_delay` unset
+    /// (`None`) on the resulting [`SemioscanConfig`] instead of passing
+    /// [`Duration::ZERO`].
+    ///
     /// # Example
     ///
     /// ```rust
@@ -386,7 +420,9 @@ impl SemioscanConfigBuilder {
     ///     .rate_limit_delay(Duration::from_millis(500))
     ///     .build();
     /// ```
+    #[track_caller]
     pub fn rate_limit_delay(mut self, delay: Duration) -> Self {
+        assert_nonzero_rate_limit_delay(delay);
         self.config.rate_limit_delay = Some(delay);
         self
     }
@@ -418,6 +454,11 @@ impl SemioscanConfigBuilder {
 
     /// Add chain-specific configuration
     ///
+    /// # Panics
+    ///
+    /// Panics if `config.rate_limit_delay` is `Some(Duration::ZERO)`. See
+    /// [`SemioscanConfigBuilder::rate_limit_delay`] for the reasoning.
+    ///
     /// # Example
     ///
     /// ```rust
@@ -437,12 +478,19 @@ impl SemioscanConfigBuilder {
     ///     )
     ///     .build();
     /// ```
+    #[track_caller]
     pub fn chain_config(mut self, chain: NamedChain, config: ChainConfig) -> Self {
         self.config.set_chain_override(chain, config);
         self
     }
 
     /// Convenience: set rate limit delay for a specific chain
+    ///
+    /// # Panics
+    ///
+    /// Panics if `delay` is [`Duration::ZERO`]. See
+    /// [`SemioscanConfigBuilder::rate_limit_delay`] for the reasoning and
+    /// how to express "no rate limit" for a chain instead.
     ///
     /// # Example
     ///
@@ -455,7 +503,9 @@ impl SemioscanConfigBuilder {
     ///     .chain_rate_limit(NamedChain::Arbitrum, Duration::from_millis(100))
     ///     .build();
     /// ```
+    #[track_caller]
     pub fn chain_rate_limit(self, chain: NamedChain, delay: Duration) -> Self {
+        assert_nonzero_rate_limit_delay(delay);
         self.modify_chain(chain, |c| c.rate_limit_delay = Some(delay))
     }
 

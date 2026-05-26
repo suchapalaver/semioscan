@@ -8,7 +8,7 @@
 //! across the public API of semioscan.
 
 use alloy_chains::NamedChain;
-use semioscan::{SemioscanConfig, SemioscanConfigBuilder};
+use semioscan::{ChainConfig, RpcConfig, SemioscanConfig, SemioscanConfigBuilder};
 use std::time::Duration;
 
 /// Test that default configuration includes rate limiting for known strict chains
@@ -169,18 +169,72 @@ fn test_multiple_chain_overrides() {
     assert_eq!(config.get_rate_limit_delay(NamedChain::Optimism), None);
 }
 
-/// Test edge case: zero duration delay (technically valid, though unusual)
+/// Zero-duration delay is rejected at the builder call site. Pins the
+/// contract documented on [`SemioscanConfigBuilder::rate_limit_delay`]'s
+/// `# Panics` section: the token-bucket layer it ultimately feeds cannot
+/// represent a zero period, so the builder fails fast at the operator's
+/// call line rather than letting `Some(Duration::ZERO)` propagate to a
+/// later pool-build panic with a useless backtrace.
 #[test]
-fn test_zero_duration_delay() {
-    let config = SemioscanConfigBuilder::new()
+#[should_panic(expected = "rate_limit_delay must be > 0")]
+fn test_rate_limit_delay_rejects_zero() {
+    let _ = SemioscanConfigBuilder::new()
         .rate_limit_delay(Duration::from_millis(0))
         .build();
+}
 
-    // Zero delay is technically Some (not None), so it overrides chain defaults
-    assert_eq!(
-        config.get_rate_limit_delay(NamedChain::Arbitrum),
-        Some(Duration::from_millis(0))
+/// Same contract for the chain-specific convenience setter.
+#[test]
+#[should_panic(expected = "rate_limit_delay must be > 0")]
+fn test_chain_rate_limit_rejects_zero() {
+    let _ = SemioscanConfigBuilder::new()
+        .chain_rate_limit(NamedChain::Arbitrum, Duration::ZERO)
+        .build();
+}
+
+/// `set_chain_override` rejects a `ChainConfig` whose `rate_limit_delay`
+/// is `Some(Duration::ZERO)`. Pins the struct-based entry point separately
+/// from the builder convenience so a regression that drops the assert here
+/// (and only here) still trips a test.
+#[test]
+#[should_panic(expected = "rate_limit_delay must be > 0")]
+fn test_set_chain_override_rejects_zero_delay() {
+    let mut config = SemioscanConfig::minimal();
+    config.set_chain_override(
+        NamedChain::Arbitrum,
+        ChainConfig {
+            max_block_range: None,
+            rate_limit_delay: Some(Duration::ZERO),
+            rpc_timeout: None,
+            serial_lookup_fallback_attempts: None,
+        },
     );
+}
+
+/// Builder-side struct setter rejects the same shape.
+#[test]
+#[should_panic(expected = "rate_limit_delay must be > 0")]
+fn test_chain_config_builder_rejects_zero_delay() {
+    let _ = SemioscanConfigBuilder::new()
+        .chain_config(
+            NamedChain::Arbitrum,
+            ChainConfig {
+                max_block_range: None,
+                rate_limit_delay: Some(Duration::ZERO),
+                rpc_timeout: None,
+                serial_lookup_fallback_attempts: None,
+            },
+        )
+        .build();
+}
+
+/// `RpcConfig::with_rate_limit_delay` rejects zero. Custom `RpcPolicy`
+/// implementors that funnel a chain delay through this setter get the
+/// same rejection as the `SemioscanConfig` path.
+#[test]
+#[should_panic(expected = "rate_limit_delay must be > 0")]
+fn test_rpc_config_with_rate_limit_delay_rejects_zero() {
+    let _ = RpcConfig::new(Duration::from_secs(30)).with_rate_limit_delay(Duration::ZERO);
 }
 
 /// Test that very large delays are supported (e.g., for testing or extreme rate limiting)

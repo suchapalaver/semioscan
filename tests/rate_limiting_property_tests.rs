@@ -26,17 +26,22 @@ fn arb_chain() -> impl Strategy<Value = NamedChain> {
     ]
 }
 
-// Helper to generate arbitrary Duration for rate limiting (0-5000ms)
+// Helper to generate arbitrary Duration for rate limiting (1-5000ms).
+//
+// The lower bound is `1` rather than `0` because the config builder rejects
+// `Duration::ZERO` as a rate-limit delay — see
+// `SemioscanConfigBuilder::rate_limit_delay`'s `# Panics` section. The
+// rejection contract itself is pinned by `prop_zero_delay_rejected` below.
 fn arb_duration() -> impl Strategy<Value = Duration> {
-    (0u64..=5000).prop_map(Duration::from_millis)
+    (1u64..=5000).prop_map(Duration::from_millis)
 }
 
 proptest! {
     /// Property: Chain-specific rate limit should always override global rate limit
     #[test]
     fn prop_chain_override_always_wins(
-        global_delay_ms in 0u64..=5000,
-        chain_delay_ms in 0u64..=5000,
+        global_delay_ms in 1u64..=5000,
+        chain_delay_ms in 1u64..=5000,
         chain in arb_chain(),
     ) {
         let global_delay = Duration::from_millis(global_delay_ms);
@@ -58,7 +63,7 @@ proptest! {
     /// Property: If no chain-specific override, global delay should apply
     #[test]
     fn prop_global_applies_without_override(
-        global_delay_ms in 0u64..=5000,
+        global_delay_ms in 1u64..=5000,
         chain in arb_chain(),
     ) {
         let global_delay = Duration::from_millis(global_delay_ms);
@@ -174,9 +179,9 @@ proptest! {
     /// Property: Config should be clonable and preserve all settings
     #[test]
     fn prop_clone_preserves_all_settings(
-        global_delay_ms in 0u64..=5000,
+        global_delay_ms in 1u64..=5000,
         chain in arb_chain(),
-        chain_delay_ms in 0u64..=5000,
+        chain_delay_ms in 1u64..=5000,
     ) {
         let original = SemioscanConfigBuilder::new()
             .rate_limit_delay(Duration::from_millis(global_delay_ms))
@@ -201,21 +206,9 @@ proptest! {
         );
     }
 
-    /// Property: Zero delay is valid and different from None
-    #[test]
-    fn prop_zero_delay_is_valid(chain in arb_chain()) {
-        let config = SemioscanConfigBuilder::new()
-            .rate_limit_delay(Duration::from_millis(0))
-            .build();
-
-        let result = config.get_rate_limit_delay(chain);
-        prop_assert!(result.is_some(), "Zero delay should be Some, not None");
-        prop_assert_eq!(result.unwrap(), Duration::from_millis(0), "Zero delay should be preserved");
-    }
-
     /// Property: Very large delays should be supported
     #[test]
-    fn prop_large_delays_supported(delay_seconds in 0u64..=3600) {
+    fn prop_large_delays_supported(delay_seconds in 1u64..=3600) {
         let large_delay = Duration::from_secs(delay_seconds);
         let config = SemioscanConfigBuilder::new()
             .rate_limit_delay(large_delay)
@@ -232,9 +225,9 @@ proptest! {
     #[test]
     fn prop_last_override_wins(
         chain in arb_chain(),
-        delay1_ms in 0u64..=5000,
-        delay2_ms in 0u64..=5000,
-        delay3_ms in 0u64..=5000,
+        delay1_ms in 1u64..=5000,
+        delay2_ms in 1u64..=5000,
+        delay3_ms in 1u64..=5000,
     ) {
         let final_delay = Duration::from_millis(delay3_ms);
 
@@ -289,7 +282,7 @@ proptest! {
     #[test]
     fn prop_independent_chain_settings(
         chain in arb_chain(),
-        delay_ms in 0u64..=5000,
+        delay_ms in 1u64..=5000,
         max_blocks in 100u64..=10000,
     ) {
         let delay = Duration::from_millis(delay_ms);
@@ -314,6 +307,18 @@ proptest! {
 }
 
 // Additional unit tests for edge cases not covered by property tests
+
+/// Zero-duration rate-limit delay is rejected by the builder. Pins the
+/// rejection contract referenced in [`arb_duration`]'s `1..=5000` range:
+/// the strategy starts at 1ms because the builder panics on zero, not
+/// because zero is otherwise meaningful.
+#[test]
+#[should_panic(expected = "rate_limit_delay must be > 0")]
+fn prop_zero_delay_rejected() {
+    let _ = SemioscanConfigBuilder::new()
+        .rate_limit_delay(Duration::ZERO)
+        .build();
+}
 
 #[test]
 fn test_chain_config_with_only_rate_limit() {
