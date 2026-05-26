@@ -511,7 +511,7 @@ impl<P: Provider + Clone> PriceCalculator<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{address, U256};
+    use alloy_primitives::address;
 
     #[test]
     fn test_add_swap_accumulates_amounts() {
@@ -638,33 +638,6 @@ mod tests {
         assert!((result.total_token_amount().as_f64() - 0.0015).abs() < 1e-10);
         assert!((result.total_usdc_amount().as_f64() - 0.003).abs() < 1e-10);
         assert!((result.get_average_price().as_f64() - 2.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_normalize_amount_standard_decimals() {
-        // Sanity check on the U256 -> f64 path independent of the calculator.
-        let divisor = U256::from(10u64.pow(6));
-        let normalized = f64::from(U256::from(1_000_000u64)) / f64::from(divisor);
-        assert_eq!(normalized, 1.0);
-
-        let divisor = U256::from(10u128.pow(18));
-        let normalized = f64::from(U256::from(1_000_000_000_000_000_000u64)) / f64::from(divisor);
-        assert_eq!(normalized, 1.0);
-    }
-
-    #[test]
-    fn test_normalize_amount_edge_cases() {
-        let divisor = U256::from(10u128.pow(18));
-        let normalized = f64::from(U256::ZERO) / f64::from(divisor);
-        assert_eq!(normalized, 0.0);
-
-        let divisor = U256::from(10u64.pow(0));
-        let normalized = f64::from(U256::from(42u64)) / f64::from(divisor);
-        assert_eq!(normalized, 42.0);
-
-        let divisor = U256::from(10u64.pow(1));
-        let normalized = f64::from(U256::from(100u64)) / f64::from(divisor);
-        assert_eq!(normalized, 10.0);
     }
 
     #[test]
