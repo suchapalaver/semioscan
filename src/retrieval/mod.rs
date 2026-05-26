@@ -13,7 +13,6 @@
 // Combined retrieval sub-modules
 pub mod balance;
 mod calculator;
-mod decimal_precision;
 mod failure;
 mod gas_calculation;
 mod gas_extractor;
@@ -27,7 +26,6 @@ pub use balance::{
     batch_fetch_balances, batch_fetch_eth_balances, BalanceError, BalanceQuery, BalanceResult,
 };
 pub use calculator::CombinedCalculator;
-pub use decimal_precision::DecimalPrecision;
 pub use types::{
     CombinedDataLookupAttempt, CombinedDataLookupFailure, CombinedDataLookupPass,
     CombinedDataLookupStage, CombinedDataResult, CombinedDataRetrievalMetadata, GasAndAmountForTx,

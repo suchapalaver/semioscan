@@ -13,8 +13,23 @@ keywords = ["ethereum", "blockchain", "analytics", "defi", "evm"]
 categories = ["cryptography::cryptocurrencies", "development-tools"]
 
 [features]
-default = []
-ws = ["alloy-provider/pubsub", "alloy-provider/ws"]
+default = ["blocks", "events", "gas", "price", "provider", "retrieval", "transport"]
+# Block-window calculations: map UTC dates to block ranges.
+blocks = []
+# Log scanning and event decoding (Transfer/Approval, EventScanner).
+events = []
+# Transport-layer Tower middleware (rate limiting, retries).
+transport = []
+# Gas cost calculation (L1 + L2). Decodes Transfer/Approval, so pulls in `events`.
+gas = ["events"]
+# DEX price extraction. Uses on-chain token decimals via `alloy-erc20`.
+price = ["dep:alloy-erc20"]
+# Runtime provider construction and pooling; layers rate limiting from `transport`.
+provider = ["transport"]
+# High-level orchestration combining gas, events, and balance lookups.
+retrieval = ["events", "gas", "dep:alloy-erc20"]
+# WebSocket transport; composes with `provider`.
+ws = ["provider", "alloy-provider/pubsub", "alloy-provider/ws"]
 
 [dependencies]
 # Core blockchain dependencies (always required)
@@ -24,7 +39,7 @@ alloy-contract = { version = "2.0", default-features = false }
 alloy-dyn-abi = { version = "1.6", default-features = false }
 alloy-json-rpc = "2.0"
 alloy-eips = { version = "2.0", default-features = false }
-alloy-erc20 = { version = "2.0", default-features = false }
+alloy-erc20 = { version = "2.0", default-features = false, optional = true }
 alloy-network = { version = "2.0", default-features = false }
 alloy-primitives = { version = "1.6", default-features = false, features = [
     "std",
@@ -75,3 +90,19 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
     "fmt",
     "json",
 ] }
+
+[[example]]
+name = "custom_dex_integration"
+required-features = ["price"]
+
+[[example]]
+name = "daily_block_window"
+required-features = ["blocks"]
+
+[[example]]
+name = "eip4844_blob_gas"
+required-features = ["gas"]
+
+[[example]]
+name = "zksync_combined_probe"
+required-features = ["retrieval", "provider"]

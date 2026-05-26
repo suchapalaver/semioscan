@@ -2,6 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#![cfg(feature = "provider")]
+
 //! Integration tests verifying that `SemioscanConfig::rpc_timeout` reaches the
 //! HTTP transport.
 //!

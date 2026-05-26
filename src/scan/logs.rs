@@ -705,6 +705,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "events")]
     #[tokio::test]
     async fn event_scanner_wrapper_skips_failed_chunks() {
         // Integration test: confirm the public EventScanner wrapper actually

@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 /// - WBTC: 8 decimals
 /// - Standard: 18 decimals
 ///
-/// Note: This is distinct from the `DecimalPrecision` enum in combined_retriever.rs,
-/// which provides chain-specific decimal rules for specific tokens. This type is
+/// Note: This is distinct from the [`DecimalPrecision`](crate::types::decimal_precision::DecimalPrecision)
+/// enum, which provides chain-specific decimal rules for specific tokens. This type is
 /// a general-purpose wrapper for any token's decimal count.
 ///
 /// # Examples

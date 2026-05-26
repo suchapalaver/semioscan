@@ -2,6 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#![cfg(feature = "provider")]
+
 //! Behaviour guard for issue #50: a provider pool that ends up with both a
 //! requests-per-second budget and a minimum-delay gap on the same chain must
 //! fail loudly at `ProviderPoolBuilder::build()` rather than silently dropping

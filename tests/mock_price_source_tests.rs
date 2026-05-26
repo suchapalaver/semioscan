@@ -2,6 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#![cfg(feature = "price")]
+
 //! Tests for MockPriceSource test helper
 //!
 //! Validates that the mock infrastructure works correctly for testing.

@@ -58,11 +58,31 @@ Top-level modules split into **public** (part of the API surface, re-exported fr
 
 ### Feature flags
 
-- `default = []` — minimal core
-- `ws` — enables WebSocket transport (`alloy-provider/pubsub` + `ws`) and `create_ws_provider`
-- `odos-example` — pulls in `odos-sdk` and enables `OdosPriceSource`, `PriceCalculator`, and the `router_token_discovery` example
+Each domain is a feature; `default` enables them all, so default builds are
+source-compatible. Inter-feature dependencies mirror real module dependencies:
 
-Any new feature-gated public export needs the matching `#[cfg(feature = "...")]` on the `pub use` line in `lib.rs`.
+- `blocks` — block-window calculations (no domain deps)
+- `events` — log scanning and event decoding (no domain deps)
+- `transport` — Tower rate-limit/retry layers (no domain deps)
+- `gas = ["events"]` — decodes `Transfer`/`Approval`, so pulls in `events`
+- `price = ["dep:alloy-erc20"]` — DEX price extraction; on-chain decimals via `alloy-erc20`
+- `provider = ["transport"]` — provider construction layered with `transport`
+- `retrieval = ["events", "gas", "dep:alloy-erc20"]` — combined gas/price/balance orchestration
+- `ws = ["provider", ...]` — WebSocket transport and `create_ws_provider`; composes with `provider`
+
+`alloy-erc20` is the one optional dependency (pulled only by `price`/`retrieval`);
+every other dependency is shared across enough domains to stay always-on.
+
+The core modules `config`, `errors`, `types`, `cache`, `scan`, and `tracing` are
+always compiled, but domain-specific items inside them (per-domain error variants,
+gas/blocks/retrieval span helpers) are `#[cfg]`-gated to their owning feature so a
+minimal build stays warning-clean under `-D warnings`.
+
+Any new feature-gated public export needs the matching `#[cfg(feature = "...")]` on
+the `pub use` line in `lib.rs`. Feature-specific integration tests carry a
+`#![cfg(feature = "...")]` crate attribute; feature-specific examples declare
+`required-features` in `Cargo.toml`. CI exercises `default`, `--all-features`, and
+`--no-default-features` for test, clippy, and doc.
 
 ### Testing strategy
 

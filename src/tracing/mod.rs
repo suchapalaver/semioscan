@@ -6,6 +6,7 @@
 //!
 //! This module provides structured tracing support for semioscan operations.
 
+#[cfg(any(feature = "blocks", feature = "gas", feature = "retrieval"))]
 pub(crate) mod spans;
 
 // Note: All span functions are internal (pub(crate)) and not re-exported

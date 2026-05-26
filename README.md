@@ -93,7 +93,29 @@ semioscan = "0.12"
 
 ### Feature Flags
 
-- **`ws`**: Enables WebSocket transport (`alloy-provider/pubsub` + `ws`) and `create_ws_provider` for streaming event subscriptions
+Each domain is a Cargo feature. The `default` feature enables all of them, so a
+plain `semioscan = "0.14"` dependency gives you the full library. To slim the
+build down to just the domains you use, disable defaults and opt in:
+
+```toml
+[dependencies]
+# Just block-window calculations:
+semioscan = { version = "0.14", default-features = false, features = ["blocks"] }
+```
+
+| Feature | Provides | Enables |
+| --- | --- | --- |
+| `blocks` | block-window (date → block range) calculations | — |
+| `events` | log scanning and event decoding (`Transfer`/`Approval`, `EventScanner`) | — |
+| `transport` | Tower rate-limit and retry layers | — |
+| `gas` | L1/L2 gas cost calculation | `events` |
+| `price` | DEX price extraction (reads on-chain token decimals) | — |
+| `provider` | runtime provider construction and pooling | `transport` |
+| `retrieval` | combined gas/price/balance orchestration | `events`, `gas` |
+| `ws` | WebSocket transport and `create_ws_provider` for streaming subscriptions | `provider` |
+
+A `--no-default-features` build with no domains selected compiles only the core
+configuration, error, and strong-type machinery.
 
 ## Quick Start
 

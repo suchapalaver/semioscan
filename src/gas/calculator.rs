@@ -36,8 +36,8 @@ use tokio::sync::Mutex;
 
 use crate::config::SemioscanConfig;
 use crate::gas::cache::GasCache;
-use crate::retrieval::DecimalPrecision;
 use crate::types::config::TransactionCount;
+use crate::types::decimal_precision::DecimalPrecision;
 use crate::types::fees::L1DataFee;
 use crate::types::gas::{BlobCount, BlobGasPrice, GasAmount, GasBreakdown, GasPrice};
 use crate::types::wei::WeiAmount;
