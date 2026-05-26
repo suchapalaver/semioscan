@@ -84,8 +84,13 @@ use serde::Serialize;
 
 pub use crate::types::price::PriceSourceError;
 
+mod aggregator;
 pub mod cache;
 pub mod calculator;
+mod decimals;
+mod extractor;
+mod normalize;
+mod scanner;
 
 pub use calculator::{PriceCalculator, RawSwapResult, TokenPriceResult};
 
