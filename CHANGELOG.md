@@ -45,6 +45,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `RateLimitLayer::new`, `::per_second`, and `::with_min_delay` now panic
+  at construction when given zero arguments, instead of silently building
+  a degenerate layer. Previously `RateLimitLayer::per_second(0)` produced
+  a token bucket with capacity zero and a refill rate of zero, so the
+  first acquire computed `wait_nanos = 1.0 / 0.0 = +inf` and the service
+  stalled indefinitely on the first request; `with_min_delay(Duration::
+  ZERO)` produced one whose `refill_rate` was `+inf` and whose refill
+  arithmetic tainted the token count with `NaN`, leaving every subsequent
+  acquire returning implementation-defined wait times. An operator who
+  loaded a per-chain pacing config from a TOML/YAML file where
+  `min_delay_ms` defaulted to `0` — or who wrote `with_rate_limit(0)`
+  thinking it disabled the rate-limit budget — would see flaky throughput
+  or a hung provider with no error message pointing at the misconfigured
+  layer. The constructors now reject both shapes with a panic that names
+  the invalid axis and points operators at the documented "leave the axis
+  unset on `ProviderConfig` to disable" idiom, so misconfiguration
+  surfaces at construction time rather than as runtime pathology. Closes
+  #53.
 - Provider pools built through `ProviderPoolBuilder::with_rpc_policy`
   now honour the policy's per-chain rate-limit delay. Operators who
   configured `SemioscanConfigBuilder::chain_rate_limit(...)` or

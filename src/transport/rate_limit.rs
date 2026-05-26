@@ -51,6 +51,17 @@ impl RateLimitLayer {
     /// * `requests` - Maximum number of requests allowed in the given period
     /// * `period` - The time period for the rate limit
     ///
+    /// # Panics
+    ///
+    /// Panics if `requests` is `0` or `period` is [`Duration::ZERO`]. Either
+    /// value would produce a degenerate token bucket whose math cannot
+    /// represent a finite rate: a zero budget would stall every request
+    /// indefinitely on the first acquire, and a zero refill period would
+    /// taint the refill rate with `inf`/`NaN` so subsequent acquires return
+    /// implementation-defined wait times. If you want to disable pacing,
+    /// leave the relevant axis on [`ProviderConfig`](crate::provider::ProviderConfig)
+    /// unset (i.e. `None`) instead of passing zero.
+    ///
     /// # Example
     ///
     /// ```rust
@@ -63,7 +74,18 @@ impl RateLimitLayer {
     /// // Allow 100 requests per minute
     /// let layer = RateLimitLayer::new(100, Duration::from_secs(60));
     /// ```
+    #[track_caller]
     pub fn new(requests: u32, period: Duration) -> Self {
+        assert!(
+            requests > 0,
+            "RateLimitLayer requires requests > 0; got 0. \
+             To disable rate limiting, leave the axis unset on ProviderConfig instead of passing zero."
+        );
+        assert!(
+            !period.is_zero(),
+            "RateLimitLayer requires period > 0; got Duration::ZERO. \
+             To disable pacing, leave min_delay unset on ProviderConfig instead of passing Duration::ZERO."
+        );
         Self {
             state: Arc::new(Mutex::new(RateLimitState::new(requests, period))),
         }
@@ -73,6 +95,11 @@ impl RateLimitLayer {
     ///
     /// This is a convenience constructor for common rate limiting scenarios.
     ///
+    /// # Panics
+    ///
+    /// Panics if `requests` is `0`. See [`RateLimitLayer::new`] for the
+    /// reasoning and how to express "no rate limit" instead.
+    ///
     /// # Example
     ///
     /// ```rust
@@ -81,6 +108,7 @@ impl RateLimitLayer {
     /// // 25 requests per second
     /// let layer = RateLimitLayer::per_second(25);
     /// ```
+    #[track_caller]
     pub fn per_second(requests: u32) -> Self {
         Self::new(requests, Duration::from_secs(1))
     }
@@ -89,6 +117,11 @@ impl RateLimitLayer {
     ///
     /// This is useful when you want to ensure a fixed delay between
     /// consecutive requests rather than allowing bursts.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `delay` is [`Duration::ZERO`]. See [`RateLimitLayer::new`]
+    /// for the reasoning and how to express "no pacing" instead.
     ///
     /// # Example
     ///
@@ -99,6 +132,7 @@ impl RateLimitLayer {
     /// // At least 100ms between requests (max 10 req/s)
     /// let layer = RateLimitLayer::with_min_delay(Duration::from_millis(100));
     /// ```
+    #[track_caller]
     pub fn with_min_delay(delay: Duration) -> Self {
         Self::new(1, delay)
     }
@@ -267,6 +301,40 @@ mod tests {
     async fn test_rate_limit_per_second() {
         let layer = RateLimitLayer::per_second(25);
         assert!(layer.state.lock().await.capacity == 25);
+    }
+
+    // The three panic tests below pin the constructor contract documented in
+    // each `# Panics` section. Without them, `RateLimitLayer::per_second(0)`
+    // builds a layer that stalls every request indefinitely on the first
+    // acquire (capacity = 0, refill_rate = 0 ⇒ wait_nanos = +inf), and
+    // `RateLimitLayer::with_min_delay(Duration::ZERO)` builds one whose
+    // refill math taints `tokens` with `NaN` so every subsequent acquire
+    // returns implementation-defined wait times. Catching this at
+    // construction makes the misconfiguration visible immediately instead
+    // of as flaky throughput or a hung provider in production.
+
+    #[test]
+    #[should_panic(expected = "requests > 0")]
+    fn test_rate_limit_layer_new_rejects_zero_requests() {
+        let _ = RateLimitLayer::new(0, Duration::from_secs(1));
+    }
+
+    #[test]
+    #[should_panic(expected = "period > 0")]
+    fn test_rate_limit_layer_new_rejects_zero_period() {
+        let _ = RateLimitLayer::new(10, Duration::ZERO);
+    }
+
+    #[test]
+    #[should_panic(expected = "requests > 0")]
+    fn test_rate_limit_per_second_rejects_zero() {
+        let _ = RateLimitLayer::per_second(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "period > 0")]
+    fn test_rate_limit_with_min_delay_rejects_zero() {
+        let _ = RateLimitLayer::with_min_delay(Duration::ZERO);
     }
 
     #[tokio::test]

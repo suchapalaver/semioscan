@@ -30,6 +30,7 @@ use super::AnyHttpProvider;
 /// Precedence: when both axes are set, `rate_limit_per_second` wins and
 /// `min_delay` is dropped with a warn. This matches the documented
 /// `ProviderPoolBuilder` precedence and the historical HTTP behaviour.
+#[track_caller]
 pub(super) fn rate_limit_layer_for(
     rate_limit_per_second: Option<u32>,
     min_delay: Option<Duration>,
