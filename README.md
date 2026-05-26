@@ -88,19 +88,19 @@ Add semioscan to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-semioscan = "0.12"
+semioscan = "0.15"
 ```
 
 ### Feature Flags
 
 Each domain is a Cargo feature. The `default` feature enables all of them, so a
-plain `semioscan = "0.14"` dependency gives you the full library. To slim the
+plain `semioscan = "0.15"` dependency gives you the full library. To slim the
 build down to just the domains you use, disable defaults and opt in:
 
 ```toml
 [dependencies]
 # Just block-window calculations:
-semioscan = { version = "0.14", default-features = false, features = ["blocks"] }
+semioscan = { version = "0.15", default-features = false, features = ["blocks"] }
 ```
 
 | Feature | Provides | Enables |

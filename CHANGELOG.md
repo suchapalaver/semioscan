@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-05-26
+
 ### Breaking Changes
 
 - A provider configuration that ends up with both a requests-per-second
@@ -60,9 +62,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default-handle unknown variants are unaffected; consumers that match
   only the variants they care about and ignore the rest gain stability
   across future variant additions. Closes #62.
+- A `semioscan` dependency built with `default-features = false` now
+  compiles only the core configuration, error, and strong-type machinery
+  rather than the whole crate. The crate previously had a single `ws`
+  feature and no domain gating, so disabling default features still pulled
+  in every module; each domain is now its own feature and `default` enables
+  them all. Consumers who relied on `default-features = false` to get the
+  full API must now list the domains they need (or simply leave default
+  features on). The common `semioscan = "0.15"` dependency is unaffected —
+  it still gets the full library. Closes #21.
 
 ### Added
 
+- Domain-oriented Cargo features let downstream crates compile only the
+  parts of semioscan they use. Each domain is a feature — `blocks`,
+  `events`, `gas`, `price`, `provider`, `retrieval`, `transport` — and the
+  existing `ws` feature now composes with `provider`. Feature dependencies
+  mirror real module dependencies (`gas` enables `events`, `provider`
+  enables `transport`, `retrieval` enables `events` and `gas`), and the
+  `alloy-erc20` dependency is compiled only for `price`/`retrieval` builds.
+  A crate that only needs block-window math can now depend on
+  `semioscan = { version = "0.15", default-features = false, features = ["blocks"] }`.
+  Closes #21.
 - Endpoints added to a provider pool can now opt into minimum-delay
   request pacing via `ChainEndpoint::with_min_delay`, mirroring the
   setter that already existed for typed providers. Pools previously
