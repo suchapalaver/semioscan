@@ -71,8 +71,18 @@ impl ProviderConfig {
     ///
     /// This is an alternative to rate limiting that ensures a minimum
     /// time gap between consecutive requests.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `delay` is [`Duration::ZERO`]. The token-bucket layer this
+    /// value ultimately reaches cannot represent a zero period; see
+    /// [`RateLimitLayer::new`](crate::transport::RateLimitLayer::new). To
+    /// express "no pacing", leave `min_delay` unset (`None`) rather than
+    /// passing [`Duration::ZERO`].
     #[must_use]
+    #[track_caller]
     pub fn with_min_delay(mut self, delay: Duration) -> Self {
+        super::assert_nonzero_min_delay(delay);
         self.min_delay = Some(delay);
         self
     }
@@ -178,5 +188,18 @@ mod tests {
         let config = ProviderConfig::alchemy("my-api-key", "eth-mainnet");
         assert!(config.url.contains("alchemy.com"));
         assert!(config.url.contains("my-api-key"));
+    }
+
+    /// Zero-duration `min_delay` is rejected at the builder call site.
+    /// Pins the contract documented on
+    /// [`ProviderConfig::with_min_delay`]'s `# Panics` section: the
+    /// token-bucket layer it ultimately feeds cannot represent a zero
+    /// period, so the builder fails fast at the operator's call line
+    /// rather than letting `Some(Duration::ZERO)` propagate to a later
+    /// pool-build panic with a useless backtrace.
+    #[test]
+    #[should_panic(expected = "min_delay must be > 0")]
+    fn test_provider_config_with_min_delay_rejects_zero() {
+        let _ = ProviderConfig::new("https://eth.llamarpc.com").with_min_delay(Duration::ZERO);
     }
 }

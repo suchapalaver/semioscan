@@ -536,8 +536,17 @@ impl ChainEndpoint {
     /// Mirrors [`ProviderConfig::with_min_delay`](crate::provider::ProviderConfig::with_min_delay):
     /// the underlying transport installs a layer that guarantees at least
     /// `delay` between consecutive RPC calls.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `delay` is [`Duration::ZERO`]. See
+    /// [`ProviderConfig::with_min_delay`](crate::provider::ProviderConfig::with_min_delay)
+    /// for the reasoning and how to express "no pacing" for an endpoint
+    /// instead.
     #[must_use]
+    #[track_caller]
     pub fn with_min_delay(mut self, delay: Duration) -> Self {
+        super::assert_nonzero_min_delay(delay);
         self.min_delay = Some(delay);
         self
     }
@@ -702,6 +711,20 @@ mod tests {
         let pool = ProviderPool::new();
         let result = pool.add(NamedChain::Mainnet, "not a valid url", None);
         assert!(result.is_err());
+    }
+
+    /// Zero-duration `min_delay` is rejected at the endpoint builder call
+    /// site. Pins the contract documented on
+    /// [`ChainEndpoint::with_min_delay`]'s `# Panics` section: the
+    /// token-bucket layer it ultimately feeds cannot represent a zero
+    /// period, so the setter fails fast at the operator's call line
+    /// rather than letting `Some(Duration::ZERO)` propagate to a later
+    /// pool-build panic with a useless backtrace.
+    #[test]
+    #[should_panic(expected = "min_delay must be > 0")]
+    fn test_chain_endpoint_with_min_delay_rejects_zero() {
+        let _ = ChainEndpoint::new(NamedChain::Mainnet, "https://eth.llamarpc.com")
+            .with_min_delay(Duration::ZERO);
     }
 
     #[test]

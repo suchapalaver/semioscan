@@ -76,6 +76,23 @@ mod factory;
 mod http_client;
 mod pool;
 
+/// Panic with a uniform message if a provider-layer `min_delay` is
+/// [`Duration::ZERO`](std::time::Duration::ZERO).
+///
+/// Every public setter that stores a minimum inter-request delay on
+/// [`ProviderConfig`] or [`pool::ChainEndpoint`] funnels through this check
+/// so the rejection contract is identical across the provider-builder
+/// surface and matches the layer-level guard in
+/// [`RateLimitLayer::new`](crate::transport::RateLimitLayer::new).
+#[track_caller]
+fn assert_nonzero_min_delay(delay: std::time::Duration) {
+    assert!(
+        !delay.is_zero(),
+        "min_delay must be > 0; got Duration::ZERO. \
+         To disable pacing, leave min_delay unset (None) instead of passing Duration::ZERO."
+    );
+}
+
 pub use config::ProviderConfig;
 #[cfg(feature = "ws")]
 pub use factory::create_ws_provider;
