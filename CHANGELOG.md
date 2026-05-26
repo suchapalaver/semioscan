@@ -15,15 +15,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Pools built through `ProviderPoolBuilder` that combined the pool-wide
   (or endpoint-level) `with_rate_limit` knob with a policy-supplied
   `rate_limit_delay` — or any direct factory caller that set both
-  `ProviderConfig::with_rate_limit` and `ProviderConfig::with_min_delay`
-  on the same config — previously installed only the requests-per-second
-  layer and logged a `tracing::warn!` that was easy to miss. The same
-  combination now returns `RpcError::ConflictingRateLimit`, naming the
-  rate-limit-per-second and min-delay values that conflicted. Operators
-  who want a per-second budget on some chains and pacing on others should
-  move the per-second budget off the pool-wide default and onto the
-  chains that need it via `ChainEndpoint::with_rate_limit`, leaving the
-  policy delay in place for the rest. Closes #50.
+  `with_rate_limit` and `with_min_delay` on the same provider config —
+  previously installed only the requests-per-second layer and logged a
+  warning that was easy to miss. The same combination now returns an
+  error from the builder, naming the requests-per-second value and the
+  minimum delay that conflicted, so operators see the misconfiguration
+  at startup rather than as 429s in production. Operators who want a
+  per-second budget on some chains and pacing on others should move the
+  per-second budget off the pool-wide default and onto the chains that
+  need it via `ChainEndpoint::with_rate_limit`, leaving the policy
+  delay in place for the rest. Closes #50.
 - The per-chain RPC settings surfaced by `RpcPolicy::rpc_config` now also
   carry the chain's rate-limit delay alongside its request timeout.
   Downstream policy implementations that return this configuration
