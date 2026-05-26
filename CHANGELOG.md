@@ -49,6 +49,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`current.saturating_add(chunk_size - 1).min(end)` per chunk,
   advancing via `to_block.checked_add(1)` so the loop breaks when
   the chunk ends at `u64::MAX`). Closes #36.
+- Exhaustive `match` arms over `RpcError` written in a downstream crate
+  must now include a wildcard (`_ => ...`) fallback. The enum is now
+  marked `#[non_exhaustive]`, matching the discipline already in place
+  on the crate's other public provider-surface types (`RpcConfig`,
+  `ChainEndpoint`) — so future operational variants (e.g. the
+  `ConflictingRateLimit` variant added in this release, or further
+  per-endpoint health/quota signals) can be added without forcing
+  another breaking change at this boundary. Consumers that already
+  default-handle unknown variants are unaffected; consumers that match
+  only the variants they care about and ignore the rest gain stability
+  across future variant additions. Closes #62.
 
 ### Added
 

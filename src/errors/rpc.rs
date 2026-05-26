@@ -80,7 +80,18 @@ use alloy_transport::TransportError;
 /// };
 /// println!("Error: {}", error);
 /// ```
+///
+/// # Stability
+///
+/// This enum is marked `#[non_exhaustive]`. New variants may be added in
+/// future releases without a major-version bump, so downstream `match`
+/// arms over `RpcError` from another crate must include a wildcard
+/// (`_ => ...`) arm. This mirrors the discipline already applied to the
+/// crate's other public configuration types (`RpcConfig`,
+/// `ChainEndpoint`) so that adding a new operational error variant does
+/// not force every consumer to recompile.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum RpcError {
     /// Failed to fetch logs from the blockchain.
     ///
