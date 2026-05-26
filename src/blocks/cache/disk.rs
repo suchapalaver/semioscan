@@ -16,9 +16,10 @@ use tokio::sync::Mutex;
 use tokio::task::JoinError;
 use tracing::{debug, info, warn};
 
-use super::{types::TimestampMillis, BlockWindowCache, CacheKey, CacheStats};
+use super::{BlockWindowCache, CacheKey, CacheStats};
 use crate::blocks::window::DailyBlockWindow;
 use crate::errors::BlockWindowError;
+use crate::types::cache::TimestampMillis;
 
 /// Current cache format version
 const CACHE_VERSION: u32 = 1;

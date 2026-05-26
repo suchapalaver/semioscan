@@ -23,6 +23,15 @@
 //! - `cache` - Caching infrastructure (internal)
 //! - `retrieval` - Data orchestration (internal)
 //! - `tracing` - Observability (internal)
+//!
+//! # Preferred imports
+//!
+//! The most commonly used types are re-exported at the crate root, so
+//! `use semioscan::{GasCostCalculator, PriceCalculator, BlockWindowCalculator};`
+//! covers typical usage. Domain-specific items that aren't part of that facade
+//! live under their public modules — for example a custom price source pulls
+//! `PriceSource` and `PriceSourceError` from `semioscan::price`, and transport
+//! layers come from `semioscan::transport`.
 
 // === Module Declarations ===
 mod blocks;
@@ -80,7 +89,7 @@ pub use blocks::{
     MemoryCache, NoOpCache, UnixTimestamp, DEFAULT_HEAD_TTL,
 };
 
-// === Cache Types (from blocks/cache/types, re-exported via types/cache) ===
+// === Cache Types (from types/cache) ===
 pub use types::cache::{AccessSequence, TimestampMillis};
 
 // === Events (from events/) ===

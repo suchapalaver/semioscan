@@ -46,7 +46,6 @@ use crate::errors::BlockWindowError;
 mod disk;
 mod memory;
 mod noop;
-pub mod types;
 
 pub use disk::DiskCache;
 pub use memory::MemoryCache;
