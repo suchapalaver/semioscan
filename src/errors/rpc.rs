@@ -57,6 +57,7 @@
 //! ```
 
 use std::borrow::Cow;
+use std::time::Duration;
 
 use alloy_primitives::{BlockNumber, TxHash};
 use alloy_transport::TransportError;
@@ -215,6 +216,33 @@ pub enum RpcError {
     /// such as during WebSocket handshake or HTTP connection establishment.
     #[error("Failed to connect to provider: {0}")]
     ProviderConnectionFailed(String),
+
+    /// A provider configuration set both `rate_limit_per_second` and
+    /// `min_delay` on the same endpoint.
+    ///
+    /// Only one rate-limit layer is installed per endpoint, so one of the
+    /// two axes would be silently dropped on the wire. Builders now refuse
+    /// the over-specified configuration up front instead of guessing which
+    /// axis the operator meant.
+    ///
+    /// To pace some chains by a per-second budget and others by a minimum
+    /// delay in the same pool, set the per-second budget per endpoint via
+    /// [`ChainEndpoint::with_rate_limit`](crate::provider::ChainEndpoint::with_rate_limit)
+    /// rather than the pool-wide
+    /// [`ProviderPoolBuilder::with_rate_limit`](crate::provider::ProviderPoolBuilder::with_rate_limit),
+    /// leaving the policy `rate_limit_delay` in place for the chains that
+    /// need pacing instead.
+    #[error(
+        "conflicting rate-limit configuration: both rate_limit_per_second \
+         ({rate_limit_per_second}) and min_delay ({min_delay:?}) set for the \
+         same endpoint; set only one axis per endpoint"
+    )]
+    ConflictingRateLimit {
+        /// The requests-per-second budget that was set.
+        rate_limit_per_second: u32,
+        /// The minimum delay between requests that was set.
+        min_delay: Duration,
+    },
 }
 
 impl RpcError {

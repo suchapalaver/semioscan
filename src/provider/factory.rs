@@ -21,30 +21,28 @@ use super::AnyHttpProvider;
 /// rate-limit layer the transport should install, or `None` for unpaced.
 ///
 /// Centralising the dispatch here keeps the HTTP and WS factories from
-/// drifting on which axis wins when both are set, and makes the
-/// construction-time `tracing::warn!` for the over-specified case fire
-/// from one place regardless of transport. Adding a new rate-limit axis
-/// is a single edit to this helper rather than a parallel change in
-/// every factory.
+/// drifting on which combination produces which layer. Adding a new
+/// rate-limit axis is a single edit to this helper rather than a parallel
+/// change in every factory.
 ///
-/// Precedence: when both axes are set, `rate_limit_per_second` wins and
-/// `min_delay` is dropped with a warn. This matches the documented
-/// `ProviderPoolBuilder` precedence and the historical HTTP behaviour.
+/// When both axes are set the helper returns
+/// [`RpcError::ConflictingRateLimit`] rather than guessing which axis the
+/// operator meant — only one rate-limit layer can be installed per
+/// endpoint, so silently dropping one of the two would mismatch the
+/// configuration the operator wrote.
 #[track_caller]
 pub(super) fn rate_limit_layer_for(
     rate_limit_per_second: Option<u32>,
     min_delay: Option<Duration>,
-) -> Option<RateLimitLayer> {
+) -> Result<Option<RateLimitLayer>, RpcError> {
     match (rate_limit_per_second, min_delay) {
-        (Some(rps), Some(_)) => {
-            tracing::warn!(
-                "Both rate_limit_per_second and min_delay specified, using rate_limit_per_second"
-            );
-            Some(RateLimitLayer::per_second(rps))
-        }
-        (Some(rps), None) => Some(RateLimitLayer::per_second(rps)),
-        (None, Some(delay)) => Some(RateLimitLayer::with_min_delay(delay)),
-        (None, None) => None,
+        (Some(rps), Some(delay)) => Err(RpcError::ConflictingRateLimit {
+            rate_limit_per_second: rps,
+            min_delay: delay,
+        }),
+        (Some(rps), None) => Ok(Some(RateLimitLayer::per_second(rps))),
+        (None, Some(delay)) => Ok(Some(RateLimitLayer::with_min_delay(delay))),
+        (None, None) => Ok(None),
     }
 }
 
@@ -63,7 +61,7 @@ pub(super) fn build_http_client(config: ProviderConfig) -> Result<RpcClient, Rpc
         .map_err(|e| RpcError::ProviderUrlInvalid(format!("{e}")))?;
 
     let builder = ClientBuilder::default();
-    let layer = rate_limit_layer_for(config.rate_limit_per_second, config.min_delay);
+    let layer = rate_limit_layer_for(config.rate_limit_per_second, config.min_delay)?;
 
     let client = match (layer, config.timeout) {
         (Some(layer), Some(timeout)) => builder
@@ -139,10 +137,11 @@ pub fn create_http_provider(config: ProviderConfig) -> Result<AnyHttpProvider, R
 ///   the configured gap between consecutive requests; useful for strict
 ///   upstreams that prefer pacing over bursts.
 ///
-/// If both `rate_limit_per_second` and `min_delay` are set, the rate-limit
-/// axis wins and a `tracing::warn!` is emitted so the operator can spot the
-/// conflicting configuration. This precedence matches every other transport
-/// in the crate.
+/// Setting both `rate_limit_per_second` and `min_delay` on the same config
+/// is rejected with [`RpcError::ConflictingRateLimit`] — only one
+/// rate-limit layer is installed per endpoint, so accepting both would
+/// silently drop one axis. This rule applies to every transport in the
+/// crate.
 ///
 /// `config.timeout` is **not honored** for WebSocket providers: the
 /// underlying `alloy_provider::WsConnect` does not expose a per-request
@@ -190,10 +189,11 @@ pub async fn create_ws_provider(
         );
     }
 
+    let layer = rate_limit_layer_for(config.rate_limit_per_second, config.min_delay)?;
+
     let ws = WsConnect::new(&config.url);
 
     let builder = ClientBuilder::default();
-    let layer = rate_limit_layer_for(config.rate_limit_per_second, config.min_delay);
 
     let client = match layer {
         Some(layer) => builder
@@ -231,9 +231,10 @@ pub async fn create_ws_provider(
 ///   upstreams that prefer pacing over bursts.
 /// - `timeout` — applied at the HTTP transport (reqwest) layer.
 ///
-/// If both `rate_limit_per_second` and `min_delay` are set, the rate-limit
-/// axis wins and a `tracing::warn!` is emitted so the operator can spot the
-/// conflicting configuration.
+/// Setting both `rate_limit_per_second` and `min_delay` on the same config
+/// is rejected with [`RpcError::ConflictingRateLimit`] — only one
+/// rate-limit layer is installed per endpoint, so accepting both would
+/// silently drop one axis.
 ///
 /// # Examples
 ///
@@ -326,13 +327,15 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    /// Build-time acceptance check for every `(rate_limit_per_second, min_delay)`
-    /// combination on the typed factory. This does NOT by itself prove the
-    /// matching rate-limit layer is installed — the pre-#45 buggy code also
-    /// returned `Ok` for `(None, Some(delay))` while silently dropping the
-    /// `min_delay`. The behavioural contract is covered by the
-    /// `typed_provider_min_delay_test` integration test; this test's job is
-    /// to keep the dispatch surface from shrinking back to the buggy shape.
+    /// Build-time acceptance check for every supported
+    /// `(rate_limit_per_second, min_delay)` combination on the typed factory.
+    /// The matrix has three accepted arms (no-axes, rps-only, min-delay-only);
+    /// the both-axes arm is rejected — see
+    /// [`typed_http_provider_rejects_both_rate_limit_axes`] for that case. This
+    /// test does NOT by itself prove the matching rate-limit layer is
+    /// installed; the behavioural contract is covered by the
+    /// `typed_provider_min_delay_test` integration test and the
+    /// `rate_limit_layer_for_covers_full_matrix` unit test.
     #[test]
     fn typed_http_provider_accepts_full_dispatch_matrix() {
         use alloy_network::Ethereum;
@@ -349,19 +352,44 @@ mod tests {
             ProviderConfig::new(url).with_min_delay(Duration::from_millis(250)),
         )
         .expect("min_delay only");
+    }
 
-        create_typed_http_provider::<Ethereum>(
+    /// The typed factory rejects a config with both `rate_limit_per_second`
+    /// and `min_delay` set, surfacing
+    /// [`RpcError::ConflictingRateLimit`] with the offending values. Pinning
+    /// the values on the error keeps a future refactor that swallowed one of
+    /// the axes back into a default from sliding past this test.
+    #[test]
+    fn typed_http_provider_rejects_both_rate_limit_axes() {
+        use alloy_network::Ethereum;
+        use std::time::Duration;
+
+        let url = "http://localhost:8545";
+        let err = create_typed_http_provider::<Ethereum>(
             ProviderConfig::new(url)
                 .with_rate_limit(5)
                 .with_min_delay(Duration::from_millis(250)),
         )
-        .expect("both axes");
+        .expect_err("both axes must be rejected");
+
+        match err {
+            RpcError::ConflictingRateLimit {
+                rate_limit_per_second,
+                min_delay,
+            } => {
+                assert_eq!(rate_limit_per_second, 5);
+                assert_eq!(min_delay, Duration::from_millis(250));
+            }
+            other => panic!("expected ConflictingRateLimit, got {other:?}"),
+        }
     }
 
     /// Build-time acceptance check against the shared builder directly, so
     /// the dispatch matrix stays exercised even if the public wrappers change
-    /// shape. See `typed_http_provider_accepts_full_dispatch_matrix` for the
-    /// limits of this kind of check and pointers to the behavioural test.
+    /// shape. The both-axes arm is rejected — see
+    /// [`shared_builder_rejects_both_rate_limit_axes`] for that case. See
+    /// `typed_http_provider_accepts_full_dispatch_matrix` for the limits of
+    /// this kind of check and pointers to the behavioural test.
     #[test]
     fn shared_builder_accepts_full_dispatch_matrix() {
         use std::time::Duration;
@@ -373,20 +401,35 @@ mod tests {
             .expect("rate_limit_per_second");
         build_http_client(ProviderConfig::new(url).with_min_delay(Duration::from_millis(250)))
             .expect("min_delay only");
-        build_http_client(
+    }
+
+    /// The shared builder rejects a config with both axes set, returning
+    /// [`RpcError::ConflictingRateLimit`]. Pinned at the shared-builder layer
+    /// so the rejection survives a refactor that bypassed the typed/erased
+    /// wrappers but kept calling `build_http_client` directly.
+    #[test]
+    fn shared_builder_rejects_both_rate_limit_axes() {
+        use std::time::Duration;
+
+        let url = "http://localhost:8545";
+        let err = build_http_client(
             ProviderConfig::new(url)
                 .with_rate_limit(5)
                 .with_min_delay(Duration::from_millis(250)),
         )
-        .expect("both axes");
+        .expect_err("both axes must be rejected");
+        assert!(
+            matches!(err, RpcError::ConflictingRateLimit { .. }),
+            "expected ConflictingRateLimit, got {err:?}"
+        );
     }
 
     /// `rate_limit_layer_for` is the single point of `(rate_limit_per_second,
     /// min_delay)` dispatch shared by the HTTP and WS factories. Drift on
-    /// which axis wins, on whether a layer is installed at all, or on
-    /// which value reaches the layer would silently change the wire
-    /// behaviour of every provider this crate builds — this test pins the
-    /// matrix shape so a regression has to touch one assertion per arm.
+    /// which arm produces which layer, on whether a layer is installed at
+    /// all, or on which value reaches the layer would silently change the
+    /// wire behaviour of every provider this crate builds — this test pins
+    /// the matrix shape so a regression has to touch one assertion per arm.
     ///
     /// Each Some-arm pins the layer's `capacity` field via the derived
     /// `Debug` output: `RateLimitLayer::per_second(rps)` constructs the
@@ -402,34 +445,49 @@ mod tests {
     /// end-to-end value pass-through for that axis is covered by the
     /// `typed_provider_min_delay_test` integration test, which observes
     /// real pacing on the wire.
+    ///
+    /// The both-axes arm is rejected with [`RpcError::ConflictingRateLimit`]
+    /// — a regression that resumed silently dropping one axis would land in
+    /// the corresponding panic site here.
     #[test]
     fn rate_limit_layer_for_covers_full_matrix() {
         use std::time::Duration;
 
         assert!(
-            rate_limit_layer_for(None, None).is_none(),
+            rate_limit_layer_for(None, None)
+                .expect("unset axes must not error")
+                .is_none(),
             "both axes unset must produce no layer"
         );
 
-        let rps_only = rate_limit_layer_for(Some(10), None).expect("rate_limit_per_second alone");
+        let rps_only = rate_limit_layer_for(Some(10), None)
+            .expect("rate_limit_per_second alone must not error")
+            .expect("rate_limit_per_second alone must produce a layer");
         assert!(
             format!("{rps_only:?}").contains("capacity: 10"),
             "rate_limit_per_second arm must produce a per_second layer with the given budget; got {rps_only:?}"
         );
 
-        let delay_only =
-            rate_limit_layer_for(None, Some(Duration::from_millis(250))).expect("min_delay alone");
+        let delay_only = rate_limit_layer_for(None, Some(Duration::from_millis(250)))
+            .expect("min_delay alone must not error")
+            .expect("min_delay alone must produce a layer");
         assert!(
             format!("{delay_only:?}").contains("capacity: 1"),
             "min_delay arm must produce a single-token (capacity = 1) layer; got {delay_only:?}"
         );
 
-        let both =
-            rate_limit_layer_for(Some(5), Some(Duration::from_millis(250))).expect("both axes set");
-        assert!(
-            format!("{both:?}").contains("capacity: 5"),
-            "both-axes arm must keep the per-second budget (rate-limit wins; min_delay dropped); got {both:?}"
-        );
+        let err = rate_limit_layer_for(Some(5), Some(Duration::from_millis(250)))
+            .expect_err("both axes set must be rejected");
+        match err {
+            RpcError::ConflictingRateLimit {
+                rate_limit_per_second,
+                min_delay,
+            } => {
+                assert_eq!(rate_limit_per_second, 5);
+                assert_eq!(min_delay, Duration::from_millis(250));
+            }
+            other => panic!("expected ConflictingRateLimit, got {other:?}"),
+        }
     }
 
     /// Surface check that `create_ws_provider` compiles and runs through
@@ -437,14 +495,16 @@ mod tests {
     /// shape-level regressions (e.g. an arm reintroducing a one-axis
     /// match and dropping a layer at the type level).
     ///
-    /// This does **not** prove the matching rate-limit layer is installed
-    /// — the WS factory's `None` arm in the pre-fix shape also returns an
-    /// error against this URL while silently dropping `min_delay`. The
+    /// The three accepted arms all fail against `not-a-valid-ws-url`
+    /// because of the URL, not the rate-limit knobs — this proves only
+    /// that the WS factory accepts the combination at the type level. The
     /// behavioural contract for the matrix lives in
     /// `rate_limit_layer_for_covers_full_matrix` above (which the WS
     /// factory routes through) and in the HTTP `typed_provider_min_delay`
     /// integration test (which exercises the same helper end-to-end on a
-    /// real transport).
+    /// real transport). The both-axes arm is rejected — see
+    /// [`create_ws_provider_rejects_both_rate_limit_axes`] for that
+    /// case.
     #[cfg(feature = "ws")]
     #[tokio::test]
     async fn create_ws_provider_accepts_full_dispatch_matrix() {
@@ -468,15 +528,30 @@ mod tests {
                 .is_err(),
             "min_delay only"
         );
+    }
+
+    /// The WS factory rejects a config with both axes set up front, before
+    /// it tries to open the WebSocket — the rejection must surface as
+    /// [`RpcError::ConflictingRateLimit`] rather than the
+    /// `ProviderConnectionFailed` an invalid URL produces. This pins the
+    /// rate-limit check ahead of the WS handshake so operators see the
+    /// configuration error even when their URL happens to be reachable.
+    #[cfg(feature = "ws")]
+    #[tokio::test]
+    async fn create_ws_provider_rejects_both_rate_limit_axes() {
+        use std::time::Duration;
+
+        let url = "not-a-valid-ws-url";
+        let err = create_ws_provider(
+            ProviderConfig::new(url)
+                .with_rate_limit(5)
+                .with_min_delay(Duration::from_millis(250)),
+        )
+        .await
+        .expect_err("both axes must be rejected");
         assert!(
-            create_ws_provider(
-                ProviderConfig::new(url)
-                    .with_rate_limit(5)
-                    .with_min_delay(Duration::from_millis(250)),
-            )
-            .await
-            .is_err(),
-            "both axes"
+            matches!(err, RpcError::ConflictingRateLimit { .. }),
+            "expected ConflictingRateLimit, got {err:?}"
         );
     }
 }
