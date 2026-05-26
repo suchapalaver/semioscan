@@ -382,10 +382,25 @@ mod tests {
 
     /// `rate_limit_layer_for` is the single point of `(rate_limit_per_second,
     /// min_delay)` dispatch shared by the HTTP and WS factories. Drift on
-    /// which axis wins, or on whether a layer is installed at all, would
-    /// silently change the wire behaviour of every provider this crate
-    /// builds — this test pins the matrix shape so a regression has to
-    /// touch one assertion per arm to land.
+    /// which axis wins, on whether a layer is installed at all, or on
+    /// which value reaches the layer would silently change the wire
+    /// behaviour of every provider this crate builds — this test pins the
+    /// matrix shape so a regression has to touch one assertion per arm.
+    ///
+    /// Each Some-arm pins the layer's `capacity` field via the derived
+    /// `Debug` output: `RateLimitLayer::per_second(rps)` constructs the
+    /// underlying state with `capacity = rps`, while
+    /// `RateLimitLayer::with_min_delay(_)` always has `capacity = 1`.
+    /// Asserting on capacity therefore (a) discriminates the two layer
+    /// kinds (a future axis-swap regression that returned
+    /// `per_second(delay_ms)` for the `min_delay` arm would land
+    /// `capacity > 1` and fail), and (b) catches per-second value
+    /// clobbering for the rate-limit arms. The `min_delay` value itself
+    /// reaches the layer via `refill_rate`, which is a non-trivial
+    /// floating-point quotient and not stably snapshot-friendly; the
+    /// end-to-end value pass-through for that axis is covered by the
+    /// `typed_provider_min_delay_test` integration test, which observes
+    /// real pacing on the wire.
     #[test]
     fn rate_limit_layer_for_covers_full_matrix() {
         use std::time::Duration;
@@ -394,17 +409,25 @@ mod tests {
             rate_limit_layer_for(None, None).is_none(),
             "both axes unset must produce no layer"
         );
+
+        let rps_only = rate_limit_layer_for(Some(10), None).expect("rate_limit_per_second alone");
         assert!(
-            rate_limit_layer_for(Some(10), None).is_some(),
-            "rate_limit_per_second alone must install a layer"
+            format!("{rps_only:?}").contains("capacity: 10"),
+            "rate_limit_per_second arm must produce a per_second layer with the given budget; got {rps_only:?}"
         );
+
+        let delay_only =
+            rate_limit_layer_for(None, Some(Duration::from_millis(250))).expect("min_delay alone");
         assert!(
-            rate_limit_layer_for(None, Some(Duration::from_millis(250))).is_some(),
-            "min_delay alone must install a layer"
+            format!("{delay_only:?}").contains("capacity: 1"),
+            "min_delay arm must produce a single-token (capacity = 1) layer; got {delay_only:?}"
         );
+
+        let both =
+            rate_limit_layer_for(Some(5), Some(Duration::from_millis(250))).expect("both axes set");
         assert!(
-            rate_limit_layer_for(Some(5), Some(Duration::from_millis(250))).is_some(),
-            "both axes set must install a layer (rate-limit wins; min_delay dropped)"
+            format!("{both:?}").contains("capacity: 5"),
+            "both-axes arm must keep the per-second budget (rate-limit wins; min_delay dropped); got {both:?}"
         );
     }
 
