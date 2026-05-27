@@ -194,7 +194,7 @@ impl<P: Provider + Clone> PriceCalculator<P> {
     ///
     /// # Example
     ///
-    /// See [`examples/custom_dex_integration.rs`](https://github.com/semiotic-ai/semioscan/blob/main/examples/custom_dex_integration.rs)
+    /// See [`examples/custom_dex_integration.rs`](https://github.com/suchapalaver/semioscan/blob/main/examples/custom_dex_integration.rs)
     /// for a complete `PriceSource` implementation that can be passed in here.
     pub fn new(
         provider: P,

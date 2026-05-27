@@ -75,7 +75,7 @@
 //! }
 //! ```
 //!
-//! See [`examples/custom_dex_integration.rs`](https://github.com/semiotic-ai/semioscan/blob/main/examples/custom_dex_integration.rs)
+//! See [`examples/custom_dex_integration.rs`](https://github.com/suchapalaver/semioscan/blob/main/examples/custom_dex_integration.rs)
 //! for a complete reference implementation.
 
 use alloy_primitives::{Address, BlockNumber, B256, U256};
