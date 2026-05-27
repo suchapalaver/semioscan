@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-05-27
+
+### Changed
+
+- Crate source moved to the personal fork at
+  `https://github.com/suchapalaver/semioscan`. The `repository`, `homepage`,
+  and author metadata, README badge, and in-source example links now point
+  there. No code or API changes.
+
 ## [0.15.0] - 2026-05-26
 
 ### Breaking Changes
