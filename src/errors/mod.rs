@@ -14,12 +14,12 @@
 //!
 //! # Architecture
 //!
-//! Each major module has its own error type:
-//! - [`BlockWindowError`] - Errors from block window calculations
-//! - [`GasCalculationError`] - Errors from gas cost calculations
-//! - [`PriceCalculationError`] - Errors from price calculations (wraps [`crate::price::PriceSourceError`])
-//! - [`EventProcessingError`] - Errors from event scanning and processing
-//! - [`RetrievalError`] - Errors from combined data retrieval operations
+//! Each major module has its own feature-gated error type:
+//! - `BlockWindowError` - Errors from block window calculations
+//! - `GasCalculationError` - Errors from gas cost calculations
+//! - `PriceCalculationError` - Errors from price calculations (wraps `PriceSourceError`)
+//! - `EventProcessingError` - Errors from event scanning and processing
+//! - `RetrievalError` - Errors from combined data retrieval operations
 //!
 //! Additionally, [`RpcError`] provides shared error variants for blockchain RPC operations.
 //!
