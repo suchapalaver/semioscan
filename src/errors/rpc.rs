@@ -238,9 +238,8 @@ pub enum RpcError {
     ///
     /// To pace some chains by a per-second budget and others by a minimum
     /// delay in the same pool, set the per-second budget per endpoint via
-    /// [`ChainEndpoint::with_rate_limit`](crate::provider::ChainEndpoint::with_rate_limit)
-    /// rather than the pool-wide
-    /// [`ProviderPoolBuilder::with_rate_limit`](crate::provider::ProviderPoolBuilder::with_rate_limit),
+    /// `ChainEndpoint::with_rate_limit` rather than the pool-wide
+    /// `ProviderPoolBuilder::with_rate_limit`,
     /// leaving the policy `rate_limit_delay` in place for the chains that
     /// need pacing instead.
     #[error(
