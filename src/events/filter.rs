@@ -175,6 +175,32 @@ impl TransferFilterBuilder {
         self
     }
 
+    /// Restrict the filter to an inclusive numeric block range.
+    ///
+    /// This is useful when using the builder directly with
+    /// `provider.get_logs()`. When using [`EventScanner`](crate::events::scanner::EventScanner),
+    /// prefer leaving the filter unbounded and pass the scan bounds to the
+    /// scanner so it can manage chunking and per-chain limits.
+    ///
+    /// # Arguments
+    ///
+    /// * `start_block` - The first block to include
+    /// * `end_block` - The last block to include
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let filter = TransferFilterBuilder::new()
+    ///     .in_block_range(1_000_000, 1_010_000)
+    ///     .build();
+    /// ```
+    #[allow(dead_code)] // Public API for external consumers, tested in unit tests
+    pub fn in_block_range(mut self, start_block: BlockNumber, end_block: BlockNumber) -> Self {
+        self.from_block = Some(start_block);
+        self.to_block = Some(end_block);
+        self
+    }
+
     /// Build the final Alloy Filter
     ///
     /// Constructs an `alloy_rpc_types::Filter` with Transfer event signature
@@ -323,6 +349,39 @@ mod tests {
         // Filter should be valid even without block range (scanner adds it)
         assert_eq!(filter.get_from_block(), None);
         assert_eq!(filter.get_to_block(), None);
+    }
+
+    #[test]
+    fn test_builder_with_block_range() {
+        let filter = TransferFilterBuilder::new()
+            .in_block_range(1_000_000, 1_010_000)
+            .build();
+
+        assert_eq!(filter.get_from_block(), Some(1_000_000));
+        assert_eq!(filter.get_to_block(), Some(1_010_000));
+    }
+
+    #[test]
+    fn test_builder_block_range_preserves_address_and_topics() {
+        let token = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let from = address!("1111111111111111111111111111111111111111");
+        let to = address!("2222222222222222222222222222222222222222");
+
+        let filter = TransferFilterBuilder::new()
+            .with_token(token)
+            .with_sender(from)
+            .with_recipient(to)
+            .in_block_range(1_000_000, 1_010_000)
+            .build();
+
+        assert_eq!(filter.get_from_block(), Some(1_000_000));
+        assert_eq!(filter.get_to_block(), Some(1_010_000));
+        assert!(filter.matches_address(token));
+        assert!(filter.matches_topics(&[
+            keccak256(b"Transfer(address,address,uint256)"),
+            from.into_word(),
+            to.into_word(),
+        ]));
     }
 
     #[test]
