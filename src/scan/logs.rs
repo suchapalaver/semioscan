@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2025 Semiotic AI, Inc.
+// SPDX-FileCopyrightText: 2026 Joseph Livesey <jlivesey@gmail.com>
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -174,10 +175,7 @@ where
             // above, so the subtraction never underflows the chunk semantics.)
             let to_block = current_block.saturating_add(chunk_size - 1).min(end_block);
 
-            let filter = filter_template
-                .clone()
-                .from_block(current_block)
-                .to_block(to_block);
+            let filter = filter_template.clone().select(current_block..=to_block);
 
             debug!(current_block, to_block, "Fetching logs for chunk");
 
@@ -728,6 +726,57 @@ mod tests {
 
         assert_eq!(logs.len(), 3, "logs from surviving chunks must be returned");
         assert_eq!(transport.call_count(), 3);
+    }
+
+    #[cfg(feature = "events")]
+    #[tokio::test]
+    async fn event_scanner_scan_range_matches_start_end_scan() {
+        use crate::events::EventScanner;
+
+        let start_end_transport = ScriptedTransport::default();
+        start_end_transport.push_success("eth_getLogs", &vec![dummy_log()]);
+        start_end_transport.push_success("eth_getLogs", &vec![dummy_log(), dummy_log()]);
+        let start_end_provider = build_provider(start_end_transport.clone());
+        let start_end_scanner = EventScanner::new(start_end_provider, config_with_chunk_size(100));
+
+        let range_transport = ScriptedTransport::default();
+        range_transport.push_success("eth_getLogs", &vec![dummy_log()]);
+        range_transport.push_success("eth_getLogs", &vec![dummy_log(), dummy_log()]);
+        let range_provider = build_provider(range_transport.clone());
+        let range_scanner = EventScanner::new(range_provider, config_with_chunk_size(100));
+
+        let start_end_logs = start_end_scanner
+            .scan(NamedChain::Arbitrum, Filter::new(), 0, 199)
+            .await
+            .expect("start/end scan succeeds");
+        let range_logs = range_scanner
+            .scan_range(NamedChain::Arbitrum, Filter::new(), 0..=199)
+            .await
+            .expect("range scan succeeds");
+
+        assert_eq!(start_end_logs.len(), range_logs.len());
+        assert_eq!(start_end_transport.call_count(), 2);
+        assert_eq!(range_transport.call_count(), 2);
+    }
+
+    #[cfg(feature = "events")]
+    #[tokio::test]
+    async fn event_scanner_scan_range_rejects_open_ended_range() {
+        use crate::events::EventScanner;
+
+        let provider = build_provider(ScriptedTransport::default());
+        let scanner = EventScanner::new(provider, config_with_chunk_size(100));
+
+        let err = scanner
+            .scan_range(NamedChain::Arbitrum, Filter::new(), 10..)
+            .await
+            .expect_err("open-ended range must be rejected");
+
+        assert!(matches!(
+            err,
+            crate::EventProcessingError::InvalidInput { .. }
+        ));
+        assert!(err.to_string().contains("finite numeric end"));
     }
 
     #[tokio::test]

@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2025 Semiotic AI, Inc.
+// SPDX-FileCopyrightText: 2026 Joseph Livesey <jlivesey@gmail.com>
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -225,11 +226,17 @@ impl TransferFilterBuilder {
             Filter::new().event_signature(*keccak256(b"Transfer(address,address,uint256)"));
 
         // Add block range if specified
-        if let Some(from) = self.from_block {
-            filter = filter.from_block(from);
-        }
-        if let Some(to) = self.to_block {
-            filter = filter.to_block(to);
+        match (self.from_block, self.to_block) {
+            (Some(from), Some(to)) => {
+                filter = filter.select(from..=to);
+            }
+            (Some(from), None) => {
+                filter = filter.from_block(from);
+            }
+            (None, Some(to)) => {
+                filter = filter.to_block(to);
+            }
+            (None, None) => {}
         }
 
         // Add token address if specified

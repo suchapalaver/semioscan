@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2025 Semiotic AI, Inc.
+// SPDX-FileCopyrightText: 2026 Joseph Livesey <jlivesey@gmail.com>
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -22,7 +23,7 @@ pub mod scanner;
 pub mod transfers;
 
 // Re-export public types
-pub use chunked::fetch_logs_chunked;
+pub use chunked::{fetch_logs_chunked, fetch_logs_chunked_range};
 pub use definitions::{Approval, Transfer};
 pub use discovery::{extract_transferred_to_tokens, extract_transferred_to_tokens_with_config};
 pub use transfers::{AmountCalculator, AmountResult};

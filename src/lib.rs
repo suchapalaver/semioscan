@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2025 Semiotic AI, Inc.
+// SPDX-FileCopyrightText: 2026 Joseph Livesey <jlivesey@gmail.com>
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -147,6 +148,8 @@ pub use types::cache::{AccessSequence, TimestampMillis};
 // === Events (from events/) ===
 #[cfg(feature = "events")]
 pub use events::fetch_logs_chunked;
+#[cfg(feature = "events")]
+pub use events::fetch_logs_chunked_range;
 #[cfg(feature = "events")]
 pub use events::EventScanner;
 #[cfg(feature = "events")]

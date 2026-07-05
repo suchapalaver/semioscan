@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2025 Semiotic AI, Inc.
+// SPDX-FileCopyrightText: 2026 Joseph Livesey <jlivesey@gmail.com>
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -18,5 +19,7 @@
 //! scanner to a shared error type.
 
 pub mod logs;
+mod range;
 
 pub use logs::LogScanner;
+pub(crate) use range::finite_block_range;

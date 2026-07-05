@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2025 Semiotic AI, Inc.
+// SPDX-FileCopyrightText: 2026 Joseph Livesey <jlivesey@gmail.com>
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -35,11 +36,12 @@ use alloy_chains::NamedChain;
 use alloy_primitives::BlockNumber;
 use alloy_provider::Provider;
 use alloy_rpc_types::{Filter, Log};
+use std::ops::RangeBounds;
 use tracing::{debug, error};
 
 use crate::config::SemioscanConfig;
 use crate::errors::EventProcessingError;
-use crate::scan::LogScanner;
+use crate::scan::{finite_block_range, LogScanner};
 
 /// Event scanner that fetches logs over a block range with chunking and
 /// rate limiting, skipping any chunk whose `eth_getLogs` call fails.
@@ -91,6 +93,35 @@ impl<P: Provider> EventScanner<P> {
             .await
     }
 
+    /// Scan for events over a finite block range with automatic chunking and
+    /// rate limiting.
+    ///
+    /// Accepts any finite [`RangeBounds<BlockNumber>`] and normalizes it to an
+    /// inclusive block window before delegating to [`EventScanner::scan`].
+    /// Open-ended ranges such as `start..` and `..=end` are rejected because
+    /// chunked scans need concrete numeric bounds.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let logs = scanner.scan_range(chain, filter, 20_000_000..=20_001_000).await?;
+    /// ```
+    pub async fn scan_range<R>(
+        &self,
+        chain: NamedChain,
+        filter_template: Filter,
+        range: R,
+    ) -> Result<Vec<Log>, EventProcessingError>
+    where
+        R: RangeBounds<BlockNumber>,
+    {
+        let range = finite_block_range(range).map_err(|err| {
+            EventProcessingError::invalid_input(format!("invalid block range: {err}"))
+        })?;
+        self.scan(chain, filter_template, range.start_block, range.end_block)
+            .await
+    }
+
     /// Scan for events and pass the resulting logs to a handler.
     ///
     /// Per-chunk RPC failures are logged and skipped. After all chunks have
@@ -138,6 +169,37 @@ impl<P: Provider> EventScanner<P> {
 
         debug!(chain = %chain, "Finished event scan with handler");
         Ok(())
+    }
+
+    /// Scan a finite block range and pass the resulting logs to a handler.
+    ///
+    /// This is the range-first counterpart to
+    /// [`EventScanner::scan_with_handler`]. Open-ended ranges are rejected
+    /// because the chunking loop requires concrete numeric bounds.
+    #[allow(dead_code)]
+    pub async fn scan_with_handler_range<R, F, Fut>(
+        &self,
+        chain: NamedChain,
+        filter_template: Filter,
+        range: R,
+        handler: F,
+    ) -> Result<(), EventProcessingError>
+    where
+        R: RangeBounds<BlockNumber>,
+        F: FnMut(Vec<Log>) -> Fut,
+        Fut: std::future::Future<Output = Result<(), EventProcessingError>>,
+    {
+        let range = finite_block_range(range).map_err(|err| {
+            EventProcessingError::invalid_input(format!("invalid block range: {err}"))
+        })?;
+        self.scan_with_handler(
+            chain,
+            filter_template,
+            range.start_block,
+            range.end_block,
+            handler,
+        )
+        .await
     }
 }
 
