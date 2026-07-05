@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.4] - 2026-07-05
+
+### Fixed
+
+- Fixed price scans so log-chunk failures now fail the scan instead of being
+  treated as empty chunks. Closes #12.
+- Fixed `DiskCache` cross-instance and cross-process inserts by protecting the
+  full load/mutate/save update with a stable companion lock file while keeping
+  atomic write/rename persistence. Closes #13.
+
 ## [0.15.3] - 2026-07-04
 
 ### Added
