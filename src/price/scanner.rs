@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2025 Semiotic AI, Inc.
+// SPDX-FileCopyrightText: 2026 Joseph Livesey <jlivesey@gmail.com>
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -11,16 +12,15 @@ use alloy_provider::Provider;
 use alloy_rpc_types::{Filter, Log};
 
 use crate::config::SemioscanConfig;
-use crate::errors::PriceCalculationError;
+use crate::errors::{PriceCalculationError, RpcError};
 use crate::price::PriceSource;
 use crate::scan::LogScanner;
 
 /// Scans a block range for swap logs emitted by a [`PriceSource`]'s router.
 ///
 /// Encapsulates the filter construction (router address + event topics) so
-/// price code never has to repeat it. Errors inside individual chunks are
-/// reported as "continue on coverage loss" — a single failing chunk reduces
-/// the swap set but never aborts the scan.
+/// price code never has to repeat it. Chunk failures abort the scan so partial
+/// log coverage cannot be cached as an authoritative price aggregate.
 pub(crate) struct SwapLogScanner<'a, P> {
     provider: &'a P,
     chain: NamedChain,
@@ -50,9 +50,8 @@ impl<'a, P: Provider + Clone> SwapLogScanner<'a, P> {
 
     /// Scan `[start, end]` for swap logs.
     ///
-    /// Returns the accumulated logs across every chunk that succeeded.
-    /// Per-chunk failures are continue-on-error: they reduce coverage but
-    /// never fail the call.
+    /// Returns the accumulated logs when every chunk succeeds.
+    /// Per-chunk failures abort the call and identify the failing block window.
     pub async fn scan(
         &self,
         start: BlockNumber,
@@ -65,7 +64,12 @@ impl<'a, P: Provider + Clone> SwapLogScanner<'a, P> {
                 self.filter.clone(),
                 start,
                 end,
-                |_, _, _| None,
+                |chunk_from, chunk_to, e| {
+                    Some(PriceCalculationError::from(RpcError::get_logs_failed(
+                        format!("swap logs from block {chunk_from} to {chunk_to}"),
+                        e,
+                    )))
+                },
             )
             .await
     }

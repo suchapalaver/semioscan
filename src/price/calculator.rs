@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2025 Semiotic AI, Inc.
+// SPDX-FileCopyrightText: 2026 Joseph Livesey <jlivesey@gmail.com>
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -562,7 +563,215 @@ impl<P: Provider + Clone> PriceCalculator<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::address;
+    use alloy_json_rpc as j;
+    use alloy_primitives::{address, Address, B256};
+    use alloy_provider::{ProviderBuilder, RootProvider};
+    use alloy_rpc_client::RpcClient;
+    use alloy_rpc_types::Log as RpcLog;
+    use alloy_transport::{TransportErrorKind, TransportFut, TransportResult};
+    use std::{
+        borrow::Cow,
+        collections::{HashMap, VecDeque},
+        sync::{Arc, Mutex as StdMutex},
+        task::{Context, Poll},
+    };
+
+    use crate::{errors::RpcError, price::PriceSourceError, SemioscanConfigBuilder};
+
+    #[derive(Clone, Debug, Default)]
+    struct MethodResponseTransport {
+        responses: Arc<StdMutex<HashMap<String, VecDeque<j::ResponsePayload>>>>,
+        request_counts: Arc<StdMutex<HashMap<String, usize>>>,
+    }
+
+    impl MethodResponseTransport {
+        fn push_success<R: serde::Serialize>(&self, method: &str, response: &R) {
+            let serialized = serde_json::to_string(response).expect("response should serialize");
+            let payload = j::ResponsePayload::Success(
+                serde_json::value::RawValue::from_string(serialized)
+                    .expect("response should convert to raw JSON"),
+            );
+            self.responses
+                .lock()
+                .expect("responses lock")
+                .entry(method.to_string())
+                .or_default()
+                .push_back(payload);
+        }
+
+        fn push_failure_msg(&self, method: &str, message: impl Into<Cow<'static, str>>) {
+            self.responses
+                .lock()
+                .expect("responses lock")
+                .entry(method.to_string())
+                .or_default()
+                .push_back(j::ResponsePayload::internal_error_message(message.into()));
+        }
+
+        fn request_count(&self, method: &str) -> usize {
+            self.request_counts
+                .lock()
+                .expect("request_counts lock")
+                .get(method)
+                .copied()
+                .unwrap_or_default()
+        }
+
+        fn map_request(&self, request: j::SerializedRequest) -> TransportResult<j::Response> {
+            let method = request.method().to_string();
+
+            {
+                let mut request_counts = self.request_counts.lock().expect("request_counts lock");
+                *request_counts.entry(method.clone()).or_default() += 1;
+            }
+
+            let payload = self
+                .responses
+                .lock()
+                .expect("responses lock")
+                .entry(method.clone())
+                .or_default()
+                .pop_front()
+                .ok_or_else(|| {
+                    TransportErrorKind::custom_str(&format!(
+                        "no mocked response queued for method {method}"
+                    ))
+                })?;
+
+            Ok(j::Response {
+                id: request.id().clone(),
+                payload,
+            })
+        }
+
+        async fn handle(self, request: j::RequestPacket) -> TransportResult<j::ResponsePacket> {
+            Ok(match request {
+                j::RequestPacket::Single(request) => {
+                    j::ResponsePacket::Single(self.map_request(request)?)
+                }
+                j::RequestPacket::Batch(requests) => j::ResponsePacket::Batch(
+                    requests
+                        .into_iter()
+                        .map(|request| self.map_request(request))
+                        .collect::<TransportResult<_>>()?,
+                ),
+            })
+        }
+    }
+
+    impl tower::Service<j::RequestPacket> for MethodResponseTransport {
+        type Response = j::ResponsePacket;
+        type Error = alloy_transport::TransportError;
+        type Future = TransportFut<'static>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: j::RequestPacket) -> Self::Future {
+            Box::pin(self.clone().handle(request))
+        }
+    }
+
+    struct NoSwapPriceSource {
+        router: Address,
+    }
+
+    impl PriceSource for NoSwapPriceSource {
+        fn router_address(&self) -> Address {
+            self.router
+        }
+
+        fn event_topics(&self) -> Vec<B256> {
+            vec![B256::ZERO]
+        }
+
+        fn extract_swap_from_log(
+            &self,
+            _log: &RpcLog,
+        ) -> Result<Option<SwapData>, PriceSourceError> {
+            Ok(None)
+        }
+    }
+
+    fn build_provider(transport: MethodResponseTransport) -> RootProvider {
+        ProviderBuilder::default().connect_client(RpcClient::new(transport, false))
+    }
+
+    fn dummy_log(address: Address) -> RpcLog {
+        RpcLog {
+            inner: alloy_primitives::Log {
+                address,
+                data: alloy_primitives::LogData::new_unchecked(
+                    vec![B256::ZERO],
+                    Default::default(),
+                ),
+            },
+            block_hash: Some(B256::repeat_byte(0x22)),
+            block_number: Some(0),
+            block_timestamp: Some(0),
+            transaction_hash: Some(B256::repeat_byte(0x33)),
+            transaction_index: Some(0),
+            log_index: Some(0),
+            removed: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn calculate_price_fails_fast_on_swap_log_chunk_error_and_does_not_cache() {
+        let chain = NamedChain::Arbitrum;
+        let router = address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let token = address!("1111111111111111111111111111111111111111");
+        let usdc = address!("2222222222222222222222222222222222222222");
+        let transport = MethodResponseTransport::default();
+
+        transport.push_success("eth_getLogs", &vec![dummy_log(router)]);
+        transport.push_failure_msg("eth_getLogs", "boom on chunk two");
+        transport.push_success("eth_getLogs", &Vec::<RpcLog>::new());
+        transport.push_success("eth_getLogs", &Vec::<RpcLog>::new());
+
+        let provider = build_provider(transport.clone());
+        let config = SemioscanConfigBuilder::new()
+            .chain_max_blocks(chain, 100)
+            .build();
+        let mut calculator = PriceCalculator::with_config(
+            provider,
+            chain,
+            usdc,
+            Box::new(NoSwapPriceSource { router }),
+            config,
+        );
+
+        let err = calculator
+            .calculate_price_between_blocks(token, 0, 199)
+            .await
+            .expect_err("mid-stream swap-log failure must abort the price calculation");
+
+        assert!(
+            matches!(
+                err,
+                PriceCalculationError::Rpc(RpcError::GetLogsFailed { .. })
+            ),
+            "chunk transport failure must be surfaced as a getLogs RPC error, got: {err:?}"
+        );
+        assert_eq!(
+            transport.request_count("eth_getLogs"),
+            2,
+            "the failing calculation should stop after the failing second chunk"
+        );
+
+        let result = calculator
+            .calculate_price_between_blocks(token, 0, 199)
+            .await
+            .expect("same range should be rescanned after the transient chunk failure clears");
+
+        assert_eq!(result.transaction_count().as_usize(), 0);
+        assert_eq!(
+            transport.request_count("eth_getLogs"),
+            4,
+            "a failed scan must not leave an authoritative cache entry for the range"
+        );
+    }
 
     #[test]
     fn test_add_swap_accumulates_amounts() {
