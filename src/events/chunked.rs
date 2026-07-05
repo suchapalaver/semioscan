@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2025 Semiotic AI, Inc.
+// SPDX-FileCopyrightText: 2026 Joseph Livesey <jlivesey@gmail.com>
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -41,9 +42,10 @@
 
 use alloy_provider::Provider;
 use alloy_rpc_types::{Filter, Log};
+use std::ops::RangeBounds;
 
 use crate::errors::EventProcessingError;
-use crate::scan::LogScanner;
+use crate::scan::{finite_block_range, LogScanner};
 use crate::SemioscanConfig;
 
 /// Fetch logs in chunks to handle large block ranges.
@@ -142,6 +144,59 @@ pub async fn fetch_logs_chunked<P: Provider>(
             },
         )
         .await
+}
+
+/// Fetch logs in chunks over a finite block range.
+///
+/// This is the range-first counterpart to [`fetch_logs_chunked`]. The supplied
+/// `filter_template` should contain addresses and topics, while `range`
+/// supplies the numeric block bounds used for chunking. Any existing block
+/// selector on `filter_template` is overwritten by `range`.
+///
+/// Open-ended ranges such as `start..` and `..=end` are rejected because
+/// chunked scans require concrete numeric bounds.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use semioscan::fetch_logs_chunked_range;
+/// use alloy_primitives::Address;
+/// use alloy_provider::ProviderBuilder;
+/// use alloy_rpc_types::Filter;
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let provider = ProviderBuilder::new()
+///     .connect_http("https://eth.llamarpc.com".parse()?);
+///
+/// let contract_address: Address = "0xdAC17F958D2ee523a2206206994597C13D831ec7".parse()?;
+/// let filter = Filter::new().address(contract_address);
+///
+/// let logs = fetch_logs_chunked_range(&provider, filter, 20_000_000..=20_000_100, 50).await?;
+/// # Ok(())
+/// # }
+/// ```
+pub async fn fetch_logs_chunked_range<P, R>(
+    provider: &P,
+    filter_template: Filter,
+    range: R,
+    chunk_size: u64,
+) -> Result<Vec<Log>, EventProcessingError>
+where
+    P: Provider,
+    R: RangeBounds<alloy_primitives::BlockNumber>,
+{
+    if chunk_size == 0 {
+        return Err(EventProcessingError::invalid_input(
+            "chunk_size must be greater than 0",
+        ));
+    }
+
+    let range = finite_block_range(range).map_err(|err| {
+        EventProcessingError::invalid_input(format!("invalid block range: {err}"))
+    })?;
+    let filter = filter_template.select(range.start_block..=range.end_block);
+
+    fetch_logs_chunked(provider, filter, chunk_size).await
 }
 
 #[cfg(test)]
@@ -338,6 +393,127 @@ mod tests {
             .expect("happy-path chunked fetch must succeed");
 
         assert_eq!(transport.calls(), 3);
+    }
+
+    #[tokio::test]
+    async fn range_api_multi_chunk_range_issues_one_call_per_chunk() {
+        let transport = ScriptedTransport::default();
+        for _ in 0..3 {
+            transport.push_success("eth_getLogs", &Vec::<RpcLog>::new());
+        }
+
+        let provider = build_provider(transport.clone());
+        let filter = Filter::new();
+
+        fetch_logs_chunked_range(&provider, filter, 0..=299, 100)
+            .await
+            .expect("range API chunked fetch must succeed");
+
+        assert_eq!(transport.calls(), 3);
+    }
+
+    #[tokio::test]
+    async fn range_api_matches_existing_start_end_api() {
+        let start_end_transport = ScriptedTransport::default();
+        start_end_transport.push_success("eth_getLogs", &vec![dummy_log()]);
+        start_end_transport.push_success("eth_getLogs", &vec![dummy_log(), dummy_log()]);
+        let start_end_provider = build_provider(start_end_transport.clone());
+
+        let range_transport = ScriptedTransport::default();
+        range_transport.push_success("eth_getLogs", &vec![dummy_log()]);
+        range_transport.push_success("eth_getLogs", &vec![dummy_log(), dummy_log()]);
+        let range_provider = build_provider(range_transport.clone());
+
+        let start_end_logs = fetch_logs_chunked(
+            &start_end_provider,
+            Filter::new().from_block(0).to_block(199),
+            100,
+        )
+        .await
+        .expect("start/end chunked fetch must succeed");
+        let range_logs = fetch_logs_chunked_range(&range_provider, Filter::new(), 0..=199, 100)
+            .await
+            .expect("range chunked fetch must succeed");
+
+        assert_eq!(start_end_logs.len(), range_logs.len());
+        assert_eq!(start_end_transport.calls(), 2);
+        assert_eq!(range_transport.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn range_api_accepts_exclusive_end_bounds() {
+        let transport = ScriptedTransport::default();
+        transport.push_success("eth_getLogs", &Vec::<RpcLog>::new());
+        transport.push_success("eth_getLogs", &Vec::<RpcLog>::new());
+
+        let provider = build_provider(transport.clone());
+
+        fetch_logs_chunked_range(&provider, Filter::new(), 0..200, 100)
+            .await
+            .expect("exclusive end range must normalize to 0..=199");
+
+        assert_eq!(transport.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn range_api_rejects_open_ended_ranges() {
+        let provider = dummy_provider();
+
+        let missing_end = fetch_logs_chunked_range(&provider, Filter::new(), 10.., 100)
+            .await
+            .expect_err("missing end must be rejected");
+        assert!(matches!(
+            missing_end,
+            EventProcessingError::InvalidInput { .. }
+        ));
+        assert!(missing_end.to_string().contains("finite numeric end"));
+
+        let missing_start = fetch_logs_chunked_range(&provider, Filter::new(), ..=10, 100)
+            .await
+            .expect_err("missing start must be rejected");
+        assert!(matches!(
+            missing_start,
+            EventProcessingError::InvalidInput { .. }
+        ));
+        assert!(missing_start.to_string().contains("finite numeric start"));
+    }
+
+    #[tokio::test]
+    async fn range_api_rejects_empty_or_inverted_ranges() {
+        let provider = dummy_provider();
+
+        let empty = fetch_logs_chunked_range(&provider, Filter::new(), 10..10, 100)
+            .await
+            .expect_err("empty range must be rejected");
+        assert!(matches!(empty, EventProcessingError::InvalidInput { .. }));
+        assert!(empty.to_string().contains("non-empty and ordered"));
+
+        let inverted_start = 20;
+        let inverted_end = 10;
+        let inverted =
+            fetch_logs_chunked_range(&provider, Filter::new(), inverted_start..=inverted_end, 100)
+                .await
+                .expect_err("inverted range must be rejected");
+        assert!(matches!(
+            inverted,
+            EventProcessingError::InvalidInput { .. }
+        ));
+        assert!(inverted.to_string().contains("non-empty and ordered"));
+    }
+
+    #[tokio::test]
+    async fn range_api_terminates_when_end_block_is_u64_max() {
+        let transport = ScriptedTransport::default();
+        transport.push_success("eth_getLogs", &Vec::<RpcLog>::new());
+        transport.push_success("eth_getLogs", &Vec::<RpcLog>::new());
+
+        let provider = build_provider(transport.clone());
+
+        fetch_logs_chunked_range(&provider, Filter::new(), u64::MAX - 1..=u64::MAX, 1)
+            .await
+            .expect("range API must terminate when end_block is u64::MAX");
+
+        assert_eq!(transport.calls(), 2);
     }
 
     #[tokio::test]

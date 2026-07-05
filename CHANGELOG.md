@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added range-first chunked log scan APIs:
+  `EventScanner::scan_range`, `EventScanner::scan_with_handler_range`, and
+  `fetch_logs_chunked_range`. These accept finite `RangeBounds<u64>` values
+  while preserving the existing start/end APIs and rejecting open-ended or
+  empty ranges. Closes #1.
+
 ## [0.15.2] - 2026-07-04
 
 ### Added
