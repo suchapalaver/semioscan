@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2025 Semiotic AI, Inc.
+// SPDX-FileCopyrightText: 2026 Joseph Livesey <jlivesey@gmail.com>
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -8,10 +9,14 @@ use alloy_chains::NamedChain;
 use async_trait::async_trait;
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::fs::File;
-use std::path::PathBuf;
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    ffi::OsString,
+    fmt,
+    fs::{File, OpenOptions},
+    path::{Path, PathBuf},
+    time::Duration,
+};
 use tokio::sync::Mutex;
 use tokio::task::JoinError;
 use tracing::{debug, info, warn};
@@ -172,8 +177,9 @@ struct DiskCacheState {
 ///
 /// # File Locking
 ///
-/// Uses advisory file locking (`fs2` crate) to prevent corruption from
-/// concurrent access. Multiple processes can safely share the same cache file.
+/// Uses advisory file locking on a stable companion lock file
+/// (`<cache-file>.lock`) to protect read-modify-write updates. Multiple
+/// processes can safely share the same cache file without losing inserts.
 ///
 /// # Performance
 ///
@@ -285,72 +291,16 @@ impl DiskCache {
 
     /// Loads cache data from disk with file locking
     async fn load(&self) -> Result<CacheData, BlockWindowError> {
-        // Cheap stat-only short-circuit on the runtime thread: skip the
-        // spawn_blocking dispatch on the very common first-call-cold-cache
-        // path. If the file is concurrently created between this check and
-        // the next get/stats/insert, we'll just pick it up then.
-        if !self.path.exists() {
-            debug!(path = %self.path.display(), "Cache file does not exist, using empty cache");
-            return Ok(CacheData::default());
-        }
-
         let path = self.path.clone();
+        let lock_path = Self::lock_path_for(&path);
         let error_path = path.clone();
 
         let data = tokio::task::spawn_blocking(move || -> Result<CacheData, BlockWindowError> {
-            let file = match File::open(&path) {
-                Ok(file) => file,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    debug!(path = %path.display(), "Cache file does not exist, using empty cache");
-                    return Ok(CacheData::default());
-                }
-                Err(e) => {
-                    return Err(BlockWindowError::cache_io_error(
-                        format!(
-                            "Failed to open cache file '{}': {}. Ensure the file is readable.",
-                            path.display(),
-                            e
-                        ),
-                        e,
-                    ));
-                }
-            };
-
-            // Shared lock via std lib — requires Rust 1.89+.
-            file.lock_shared().map_err(|e| {
-                BlockWindowError::cache_io_error(
-                    format!(
-                        "Failed to acquire read lock on cache file '{}': {}",
-                        path.display(),
-                        e
-                    ),
-                    e,
-                )
-            })?;
-
-            let data: CacheData = serde_json::from_reader(&file).map_err(|e| {
-                warn!(
-                    path = %path.display(),
-                    error = %e,
-                    "Failed to parse cache file"
-                );
-                BlockWindowError::serialization_error(e)
-            })?;
-
-            if data.version != CACHE_VERSION {
-                warn!(
-                    path = %path.display(),
-                    cached_version = data.version,
-                    current_version = CACHE_VERSION,
-                    "Cache version mismatch, ignoring cached data"
-                );
-                return Ok(CacheData::default());
-            }
-
-            Ok(data)
+            let _lock = Self::acquire_lock(&lock_path, LockMode::Shared)?;
+            Self::load_unlocked(&path)
         })
         .await
-        .map_err(|e| Self::blocking_task_error("load cache file", error_path, e))??;
+        .map_err(|e| Self::blocking_task_error(BlockingCacheOperation::Load, error_path, e))??;
 
         info!(
             path = %self.path.display(),
@@ -362,96 +312,200 @@ impl DiskCache {
         Ok(data)
     }
 
-    /// Saves cache data to disk with file locking and atomic write
-    async fn save(&self, data: CacheData) -> Result<(), BlockWindowError> {
-        let path = self.path.clone();
-        let error_path = path.clone();
-        let entry_count = data.entries.len();
+    fn load_unlocked(path: &Path) -> Result<CacheData, BlockWindowError> {
+        if !path.exists() {
+            debug!(path = %path.display(), "Cache file does not exist, using empty cache");
+            return Ok(CacheData::default());
+        }
 
-        tokio::task::spawn_blocking(move || -> Result<(), BlockWindowError> {
-            // Serialize before acquiring the lock to keep the locked window tight.
-            let json =
-                serde_json::to_vec_pretty(&data).map_err(BlockWindowError::serialization_error)?;
-
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    BlockWindowError::cache_io_error(
-                        format!(
-                            "Failed to create cache directory '{}': {}. Ensure you have write permissions.",
-                            parent.display(),
-                            e
-                        ),
-                        e,
-                    )
-                })?;
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                debug!(path = %path.display(), "Cache file does not exist, using empty cache");
+                return Ok(CacheData::default());
             }
-
-            // Write-then-rename for atomicity.
-            let temp_path = path.with_extension("tmp");
-
-            std::fs::write(&temp_path, &json).map_err(|e| {
-                BlockWindowError::cache_io_error(
+            Err(e) => {
+                return Err(BlockWindowError::cache_io_error(
                     format!(
-                        "Failed to write cache to '{}': {}. Ensure the parent directory is writable.",
-                        temp_path.display(),
-                        e
-                    ),
-                    e,
-                )
-            })?;
-
-            let file = File::open(&temp_path).map_err(|e| {
-                BlockWindowError::cache_io_error(
-                    format!(
-                        "Failed to open temp cache file '{}': {}",
-                        temp_path.display(),
-                        e
-                    ),
-                    e,
-                )
-            })?;
-
-            // Exclusive lock via std lib — requires Rust 1.89+.
-            file.lock().map_err(|e| {
-                BlockWindowError::cache_io_error(
-                    format!(
-                        "Failed to acquire write lock on cache file '{}': {}",
-                        temp_path.display(),
-                        e
-                    ),
-                    e,
-                )
-            })?;
-
-            std::fs::rename(&temp_path, &path).map_err(|e| {
-                BlockWindowError::cache_io_error(
-                    format!(
-                        "Failed to rename cache file from '{}' to '{}': {}",
-                        temp_path.display(),
+                        "Failed to open cache file '{}': {}. Ensure the file is readable.",
                         path.display(),
                         e
                     ),
                     e,
-                )
-            })?;
+                ));
+            }
+        };
 
-            // File handle (and its lock) released on scope exit.
-            Ok(())
-        })
-        .await
-        .map_err(|e| Self::blocking_task_error("save cache file", error_path, e))??;
+        let data: CacheData = serde_json::from_reader(&file).map_err(|e| {
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "Failed to parse cache file"
+            );
+            BlockWindowError::serialization_error(e)
+        })?;
 
-        debug!(
-            path = %self.path.display(),
-            entries = entry_count,
-            "Saved block window cache"
-        );
+        if data.version != CACHE_VERSION {
+            warn!(
+                path = %path.display(),
+                cached_version = data.version,
+                current_version = CACHE_VERSION,
+                "Cache version mismatch, ignoring cached data"
+            );
+            return Ok(CacheData::default());
+        }
+
+        Ok(data)
+    }
+
+    /// Saves cache data to disk with atomic write. The caller must hold the
+    /// stable cache lock for writes that participate in cross-instance safety.
+    fn save_unlocked(path: &Path, data: CacheData) -> Result<(), BlockWindowError> {
+        let json =
+            serde_json::to_vec_pretty(&data).map_err(BlockWindowError::serialization_error)?;
+
+        Self::ensure_parent_dir(path)?;
+
+        // Write-then-rename for atomicity.
+        let temp_path = path.with_extension("tmp");
+
+        std::fs::write(&temp_path, &json).map_err(|e| {
+            BlockWindowError::cache_io_error(
+                format!(
+                    "Failed to write cache to '{}': {}. Ensure the parent directory is writable.",
+                    temp_path.display(),
+                    e
+                ),
+                e,
+            )
+        })?;
+
+        std::fs::rename(&temp_path, path).map_err(|e| {
+            BlockWindowError::cache_io_error(
+                format!(
+                    "Failed to rename cache file from '{}' to '{}': {}",
+                    temp_path.display(),
+                    path.display(),
+                    e
+                ),
+                e,
+            )
+        })?;
 
         Ok(())
     }
 
+    fn insert_locked(
+        path: &Path,
+        config: &DiskCacheConfig,
+        key: CacheKey,
+        window: DailyBlockWindow,
+    ) -> Result<(usize, usize), BlockWindowError> {
+        let lock_path = Self::lock_path_for(path);
+        let _lock = Self::acquire_lock(&lock_path, LockMode::Exclusive)?;
+
+        let mut data = Self::load_unlocked(path).unwrap_or_default();
+        debug!(key = %key, "Inserting entry into disk cache");
+        data.entries.insert(key, CacheEntry::new(window));
+
+        let evicted = match config.max_entries {
+            Some(max_entries) => Self::evict_oldest(&mut data, max_entries),
+            None => 0,
+        };
+        let entry_count = data.entries.len();
+
+        Self::save_unlocked(path, data)?;
+
+        Ok((entry_count, evicted))
+    }
+
+    fn clear_locked(path: &Path) -> Result<(), BlockWindowError> {
+        let lock_path = Self::lock_path_for(path);
+        let _lock = Self::acquire_lock(&lock_path, LockMode::Exclusive)?;
+
+        if path.exists() {
+            std::fs::remove_file(path).map_err(|e| {
+                BlockWindowError::cache_io_error(
+                    format!("Failed to delete cache file '{}': {}", path.display(), e),
+                    e,
+                )
+            })?;
+        }
+
+        Ok(())
+    }
+
+    fn acquire_lock(lock_path: &Path, mode: LockMode) -> Result<File, BlockWindowError> {
+        Self::ensure_parent_dir(lock_path)?;
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .map_err(|e| {
+                BlockWindowError::cache_io_error(
+                    format!(
+                        "Failed to open cache lock file '{}': {}",
+                        lock_path.display(),
+                        e
+                    ),
+                    e,
+                )
+            })?;
+
+        match mode {
+            LockMode::Shared => file.lock_shared(),
+            LockMode::Exclusive => file.lock(),
+        }
+        .map_err(|e| {
+            BlockWindowError::cache_io_error(
+                format!(
+                    "Failed to acquire {} lock on cache lock file '{}': {}",
+                    mode,
+                    lock_path.display(),
+                    e
+                ),
+                e,
+            )
+        })?;
+
+        Ok(file)
+    }
+
+    fn ensure_parent_dir(path: &Path) -> Result<(), BlockWindowError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                BlockWindowError::cache_io_error(
+                    format!(
+                        "Failed to create cache directory '{}': {}. Ensure you have write permissions.",
+                        parent.display(),
+                        e
+                    ),
+                    e,
+                )
+            })?;
+        }
+
+        Ok(())
+    }
+
+    fn lock_path_for(path: &Path) -> PathBuf {
+        let lock_file_name = path
+            .file_name()
+            .map(|file_name| {
+                let mut name = OsString::from(file_name);
+                name.push(".lock");
+                name
+            })
+            .unwrap_or_else(|| OsString::from(".semioscan-cache.lock"));
+
+        path.with_file_name(lock_file_name)
+    }
+
     fn blocking_task_error(
-        operation: &'static str,
+        operation: BlockingCacheOperation,
         path: PathBuf,
         error: JoinError,
     ) -> BlockWindowError {
@@ -490,6 +544,38 @@ impl DiskCache {
         }
 
         evicted
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LockMode {
+    Shared,
+    Exclusive,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BlockingCacheOperation {
+    Load,
+    Insert,
+    Clear,
+}
+
+impl fmt::Display for LockMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LockMode::Shared => formatter.write_str("shared"),
+            LockMode::Exclusive => formatter.write_str("exclusive"),
+        }
+    }
+}
+
+impl fmt::Display for BlockingCacheOperation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BlockingCacheOperation::Load => formatter.write_str("load cache file"),
+            BlockingCacheOperation::Insert => formatter.write_str("insert cache entry"),
+            BlockingCacheOperation::Clear => formatter.write_str("clear cache file"),
+        }
     }
 }
 
@@ -532,49 +618,43 @@ impl BlockWindowCache for DiskCache {
         key: CacheKey,
         window: DailyBlockWindow,
     ) -> Result<(), BlockWindowError> {
+        let path = self.path.clone();
+        let config = self.config.clone();
+        let error_path = path.clone();
+
+        let (entry_count, evicted) =
+            tokio::task::spawn_blocking(move || Self::insert_locked(&path, &config, key, window))
+                .await
+                .map_err(|e| {
+                    Self::blocking_task_error(BlockingCacheOperation::Insert, error_path, e)
+                })??;
+
         let mut state = self.state.lock().await;
+        state.stats.entries = entry_count;
+        state.stats.evictions += evicted as u64;
 
-        // Load existing cache data
-        let mut data = self.load().await.unwrap_or_default();
-
-        // Insert new entry
-        debug!(key = %key, "Inserting entry into disk cache");
-        data.entries.insert(key, CacheEntry::new(window));
-
-        // Evict oldest entries if needed
-        if let Some(max_entries) = self.config.max_entries {
-            let evicted = Self::evict_oldest(&mut data, max_entries);
-            if evicted > 0 {
-                state.stats.evictions += evicted as u64;
-            }
-        }
-
-        state.stats.entries = data.entries.len();
-
-        self.save(data).await?;
+        debug!(
+            path = %self.path.display(),
+            entries = entry_count,
+            "Saved block window cache"
+        );
 
         Ok(())
     }
 
     async fn clear(&self) -> Result<(), BlockWindowError> {
-        let mut state = self.state.lock().await;
+        let path = self.path.clone();
+        let error_path = path.clone();
 
         debug!(path = %self.path.display(), "Clearing disk cache");
 
-        // Delete cache file
-        if self.path.exists() {
-            tokio::fs::remove_file(&self.path).await.map_err(|e| {
-                BlockWindowError::cache_io_error(
-                    format!(
-                        "Failed to delete cache file '{}': {}",
-                        self.path.display(),
-                        e
-                    ),
-                    e,
-                )
-            })?;
-        }
+        tokio::task::spawn_blocking(move || Self::clear_locked(&path))
+            .await
+            .map_err(|e| {
+                Self::blocking_task_error(BlockingCacheOperation::Clear, error_path, e)
+            })??;
 
+        let mut state = self.state.lock().await;
         state.stats.entries = 0;
         Ok(())
     }
@@ -605,7 +685,9 @@ mod tests {
     use super::*;
     use alloy_chains::NamedChain;
     use chrono::NaiveDate;
+    use std::sync::Arc;
     use tempfile::TempDir;
+    use tokio::sync::Barrier;
 
     fn create_test_window(start_block: u64, end_block: u64) -> DailyBlockWindow {
         DailyBlockWindow {
@@ -668,6 +750,55 @@ mod tests {
             assert!(retrieved.is_some());
             assert_eq!(retrieved.unwrap().start_block, 1000);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_inserts_from_two_instances_preserve_both_entries() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_path = temp_dir.path().join("cache.json");
+
+        let cache_a = Arc::new(DiskCache::new(&cache_path).validate().unwrap());
+        let cache_b = Arc::new(DiskCache::new(&cache_path).validate().unwrap());
+        let barrier = Arc::new(Barrier::new(3));
+
+        let key_a = create_test_key(15);
+        let key_b = create_test_key(16);
+        let window_a = create_test_window(1000, 2000);
+        let window_b = create_test_window(3000, 4000);
+
+        let insert_a = {
+            let cache = Arc::clone(&cache_a);
+            let barrier = Arc::clone(&barrier);
+            let key = key_a.clone();
+            let window = window_a.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                cache.insert(key, window).await
+            })
+        };
+
+        let insert_b = {
+            let cache = Arc::clone(&cache_b);
+            let barrier = Arc::clone(&barrier);
+            let key = key_b.clone();
+            let window = window_b.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                cache.insert(key, window).await
+            })
+        };
+
+        barrier.wait().await;
+        insert_a.await.unwrap().unwrap();
+        insert_b.await.unwrap().unwrap();
+
+        let verifier = DiskCache::new(&cache_path).validate().unwrap();
+        assert_eq!(verifier.get(&key_a).await.unwrap().start_block, 1000);
+        assert_eq!(verifier.get(&key_b).await.unwrap().start_block, 3000);
+        assert!(
+            DiskCache::lock_path_for(&cache_path).exists(),
+            "disk cache updates should coordinate through a stable companion lock file"
+        );
     }
 
     #[tokio::test]
