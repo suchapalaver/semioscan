@@ -7,12 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.2] - 2026-07-04
+
 ### Added
 
 - Added `TransferFilterBuilder::in_block_range(start_block, end_block)` so the
   documented direct `provider.get_logs()` range-filter pattern is available.
   `EventScanner` users should still pass block bounds to the scanner so it can
   manage chunking. Closes #2.
+
+### Fixed
+
+- Fixed feature-gated rustdoc links so no-default-feature documentation builds
+  do not warn on links to optional modules.
 
 ## [0.15.1] - 2026-05-27
 
