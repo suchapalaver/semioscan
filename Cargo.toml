@@ -1,6 +1,6 @@
 [package]
 name = "semioscan"
-version = "0.15.3"
+version = "0.15.4"
 edition = "2021"
 authors = ["Joseph Livesey <jlivesey@gmail.com>"]
 rust-version = "1.92"
