@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2025 Semiotic AI, Inc.
+// SPDX-FileCopyrightText: 2026 Joseph Livesey <jlivesey@gmail.com>
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -391,6 +392,131 @@ fn is_transport_kind_retryable(kind: &TransportErrorKind) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_json_rpc::{Id, Request, Response, ResponsePayload};
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex},
+    };
+    use tower::Service as _;
+
+    #[derive(Clone, Debug)]
+    struct ScriptedRetryService {
+        state: Arc<ScriptedRetryState>,
+    }
+
+    #[derive(Debug, Default)]
+    struct ScriptedRetryState {
+        outcomes: Mutex<VecDeque<ScriptedOutcome>>,
+        call_count: Mutex<usize>,
+    }
+
+    #[derive(Debug)]
+    enum ScriptedOutcome {
+        Success,
+        RetryableError,
+        NonRetryableError,
+    }
+
+    impl ScriptedRetryService {
+        fn new(outcomes: impl IntoIterator<Item = ScriptedOutcome>) -> Self {
+            Self {
+                state: Arc::new(ScriptedRetryState {
+                    outcomes: Mutex::new(outcomes.into_iter().collect()),
+                    call_count: Mutex::new(0),
+                }),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            *self.state.call_count.lock().expect("call count lock")
+        }
+
+        fn next_result(&self) -> Result<ResponsePacket, TransportError> {
+            *self.state.call_count.lock().expect("call count lock") += 1;
+
+            match self
+                .state
+                .outcomes
+                .lock()
+                .expect("outcomes lock")
+                .pop_front()
+                .expect("scripted outcome")
+            {
+                ScriptedOutcome::Success => Ok(success_response()),
+                ScriptedOutcome::RetryableError => Err(retryable_error()),
+                ScriptedOutcome::NonRetryableError => Err(non_retryable_error()),
+            }
+        }
+    }
+
+    impl tower::Service<RequestPacket> for ScriptedRetryService {
+        type Response = ResponsePacket;
+        type Error = TransportError;
+        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _request: RequestPacket) -> Self::Future {
+            let result = self.next_result();
+            Box::pin(async move { result })
+        }
+    }
+
+    fn zero_delay_retry_layer(max_retries: u32) -> RetryLayer {
+        RetryLayer::builder()
+            .max_retries(max_retries)
+            .base_delay(Duration::ZERO)
+            .max_delay(Duration::ZERO)
+            .build()
+    }
+
+    fn request_packet() -> RequestPacket {
+        Request::new("test_method", Id::Number(1), ())
+            .serialize()
+            .expect("request should serialize")
+            .into()
+    }
+
+    fn success_response() -> ResponsePacket {
+        ResponsePacket::Single(Response {
+            id: Id::Number(1),
+            payload: ResponsePayload::Success(
+                serde_json::value::RawValue::from_string("true".to_string())
+                    .expect("valid raw JSON"),
+            ),
+        })
+    }
+
+    fn retryable_error() -> TransportError {
+        TransportErrorKind::http_error(503, "temporarily unavailable".to_string())
+    }
+
+    fn non_retryable_error() -> TransportError {
+        TransportErrorKind::non_retryable_str("malformed request")
+    }
+
+    fn assert_retryable_error(error: TransportError) {
+        assert!(
+            matches!(
+                error,
+                RpcError::Transport(TransportErrorKind::HttpError(http_error))
+                    if http_error.status == 503
+            ),
+            "expected retryable HTTP 503 error"
+        );
+    }
+
+    fn assert_non_retryable_error(error: TransportError) {
+        assert!(
+            matches!(
+                error,
+                RpcError::Transport(TransportErrorKind::NonRetryable(_))
+            ),
+            "expected non-retryable transport error"
+        );
+    }
 
     #[test]
     fn test_retry_layer_default() {
@@ -487,5 +613,61 @@ mod tests {
 
         // Very high attempt number should not overflow, just cap at max_delay
         assert_eq!(calculate_backoff(50, &config), Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn retry_service_succeeds_after_retryable_failures() {
+        let inner = ScriptedRetryService::new([
+            ScriptedOutcome::RetryableError,
+            ScriptedOutcome::RetryableError,
+            ScriptedOutcome::Success,
+        ]);
+        let call_counter = inner.clone();
+        let mut service = zero_delay_retry_layer(3).layer(inner);
+
+        let response = service
+            .call(request_packet())
+            .await
+            .expect("retryable failures should eventually succeed");
+
+        assert!(matches!(response, ResponsePacket::Single(response) if response.is_success()));
+        assert_eq!(call_counter.calls(), 3);
+    }
+
+    #[tokio::test]
+    async fn retry_service_stops_after_max_retries_are_exhausted() {
+        let inner = ScriptedRetryService::new([
+            ScriptedOutcome::RetryableError,
+            ScriptedOutcome::RetryableError,
+            ScriptedOutcome::RetryableError,
+        ]);
+        let call_counter = inner.clone();
+        let mut service = zero_delay_retry_layer(2).layer(inner);
+
+        let error = service
+            .call(request_packet())
+            .await
+            .expect_err("third retryable failure should exhaust max_retries=2");
+
+        assert_retryable_error(error);
+        assert_eq!(call_counter.calls(), 3);
+    }
+
+    #[tokio::test]
+    async fn retry_service_does_not_retry_non_retryable_errors() {
+        let inner = ScriptedRetryService::new([
+            ScriptedOutcome::NonRetryableError,
+            ScriptedOutcome::Success,
+        ]);
+        let call_counter = inner.clone();
+        let mut service = zero_delay_retry_layer(3).layer(inner);
+
+        let error = service
+            .call(request_packet())
+            .await
+            .expect_err("non-retryable failure should stop immediately");
+
+        assert_non_retryable_error(error);
+        assert_eq!(call_counter.calls(), 1);
     }
 }
