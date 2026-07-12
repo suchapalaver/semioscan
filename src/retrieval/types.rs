@@ -1,8 +1,11 @@
 // SPDX-FileCopyrightText: 2025 Semiotic AI, Inc.
+// SPDX-FileCopyrightText: 2026 Joseph Livesey <jlivesey@gmail.com>
 //
 // SPDX-License-Identifier: Apache-2.0
 
 //! Data types for combined gas and amount retrieval
+
+use std::fmt;
 
 use alloy_chains::NamedChain;
 use alloy_primitives::{Address, BlockNumber, TxHash, U256};
@@ -48,12 +51,19 @@ pub enum CombinedDataLookupStage {
 }
 
 impl CombinedDataLookupStage {
+    /// Stable RPC operation label used in logs and operator-facing errors.
     #[must_use]
     pub const fn operation_name(self) -> &'static str {
         match self {
             Self::Transaction => "get_transaction_by_hash",
             Self::Receipt => "get_transaction_receipt",
         }
+    }
+}
+
+impl fmt::Display for CombinedDataLookupStage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str((*self).operation_name())
     }
 }
 
@@ -247,6 +257,18 @@ mod tests {
             blob_gas_cost: U256::from(blob_gas_cost),
             transferred_amount: U256::from(transferred_amount),
         }
+    }
+
+    #[test]
+    fn test_combined_lookup_stage_display_matches_rpc_operation_name() {
+        assert_eq!(
+            CombinedDataLookupStage::Transaction.to_string(),
+            "get_transaction_by_hash"
+        );
+        assert_eq!(
+            CombinedDataLookupStage::Receipt.to_string(),
+            "get_transaction_receipt"
+        );
     }
 
     #[test]

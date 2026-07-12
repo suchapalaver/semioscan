@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2025 Semiotic AI, Inc.
+// SPDX-FileCopyrightText: 2026 Joseph Livesey <jlivesey@gmail.com>
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -91,7 +92,7 @@ pub(crate) fn lookup_request_failed(
     error: TransportError,
 ) -> RetrievalError {
     RetrievalError::Rpc(crate::errors::RpcError::request_failed(
-        format!("{operation}({tx_hash})", operation = stage.operation_name()),
+        format!("{stage}({tx_hash})"),
         error,
     ))
 }
