@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.5] - 2026-07-12
+
+### Added
+
+- Added `Display` for `CombinedDataLookupStage` so lookup failure formatting
+  can use the typed stage directly while preserving the existing stable RPC
+  operation labels. Closes #17.
+
 ## [0.15.4] - 2026-07-05
 
 ### Fixed
